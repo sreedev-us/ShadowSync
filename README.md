@@ -1,8 +1,26 @@
 # ShadowSync
 
-ShadowSync is a GUI app for encrypted persistence in amnesic or temporary environments. It is designed for messenger profiles and similar app data that must survive across boots without leaving plain data behind.
+ShadowSync is a cross-platform encrypted persistence bridge for amnesic operating-system sessions. It was designed for workflows where the main OS should forget everything after shutdown, while selected app profiles and user files remain encrypted on removable storage.
 
-The app now uses one storage folder. Inside that folder, each app gets its own namespace:
+The project is especially useful when using Tails or another live Linux environment from a Ventoy USB drive.
+
+## Why This Exists
+
+Some laptop setups, including certain Lenovo LOQ configurations, can make ordinary live-OS persistence awkward or undesirable. Depending on firmware, storage layout, boot policy, or hardware support, relying on internal disk persistence may be unreliable, noisy, or simply not part of the threat model.
+
+The Ventoy workaround is simple:
+
+1. Boot Tails or another live OS from a Ventoy USB drive.
+2. Keep ShadowSync and your encrypted storage folder on that same removable drive.
+3. Let the live OS remain amnesic.
+4. Let ShadowSync restore only the specific app data or files you choose.
+5. When you close the app, ShadowSync encrypts the updated state back to the USB drive.
+
+This gives you app-level persistence without depending on the live OS persistence feature.
+
+## Storage Layout
+
+ShadowSync uses one storage folder:
 
 ```text
 ShadowSyncStore/
@@ -15,54 +33,22 @@ ShadowSyncStore/
         Work/
           profile.ssvault
           gocryptfs/
-    SimpleX/
-      profiles/
-        Default/
-          profile.ssvault
-          gocryptfs/
   files/
     manual-files.ssvault
   user_registry.enc
 ```
 
-This lets one USB folder hold multiple apps, multiple identities per app, and a separate manual files vault for videos, audio, documents, and any other files.
+This supports multiple apps, multiple identities per app, and a separate manual files vault for videos, audio, documents, archives, and other files.
 
-## Windows App
+## Modes
 
-ShadowSync runs on Windows with Python, and it can also be built as a normal `.exe`.
-
-Run from source:
-
-```powershell
-python -m pip install -r requirements.txt
-python .\shadowsync.py
-```
-
-Build a Windows app:
-
-```powershell
-.\build_windows.ps1 -InstallTools
-```
-
-After the build completes, use:
-
-```text
-dist\ShadowSync.exe
-```
-
-That Windows app can unlock and export the portable `.ssvault` data created on Linux or Tails. FUSE/gocryptfs folders remain Linux/Tails-specific, but DIY app vaults and the manual files vault are cross-platform.
-
-## Two Modes
-
-### Mode 1: DIY Sync-on-Close
+### DIY Sync-on-Close
 
 This is the portable mode.
 
-ShadowSync decrypts `profile.ssvault` into the selected profile folder, launches the app, waits for that exact child process to close, then compresses and encrypts the updated profile back into `profile.ssvault`.
+ShadowSync decrypts `profile.ssvault` into the selected app profile folder, launches the chosen executable or AppImage, waits for it to close, then compresses and encrypts the updated profile back into `profile.ssvault`.
 
-Use this when you want the same encrypted data to open on Windows, Tails, and other Linux systems.
-
-DIY mode also runs an auto-save heartbeat every 15 minutes. If the profile folder changed, ShadowSync updates the encrypted vault in the background to reduce data loss from crashes or battery failure.
+DIY mode works across Windows, Tails, and other Linux systems.
 
 Encryption:
 
@@ -71,42 +57,53 @@ Encryption:
 - Encryption: AES-256-GCM
 - File: `profile.ssvault`
 
-### Mode 2: On-the-Fly FUSE
+DIY mode also runs a heartbeat save every 15 minutes when changes are detected.
+
+### On-the-Fly FUSE
 
 This is the real-time Linux/Tails mode.
 
-ShadowSync uses `gocryptfs` to mount an encrypted folder directly at the selected profile folder. The messenger app writes to what looks like a normal folder, while `gocryptfs` encrypts the data immediately into the USB storage folder.
+ShadowSync uses `gocryptfs` to mount an encrypted folder directly at the selected profile path. The app writes to what looks like a normal folder, while `gocryptfs` encrypts the data immediately into the USB storage folder.
 
-Use this when you want instant encrypted writes and are running Linux/Tails with `gocryptfs` available.
+FUSE mode is Linux/Tails-specific. For Windows portability, use DIY mode.
 
-FUSE mode is not Windows-portable by itself because Windows cannot normally mount `gocryptfs` folders. For Windows portability, use DIY mode.
-
-ShadowSync looks for a bundled static Linux `gocryptfs` binary first:
+ShadowSync looks for a bundled static Linux binary first:
 
 ```text
 assets/gocryptfs
 ```
 
-If that file is missing, it falls back to the host system's `gocryptfs`. Keeping a known-good static binary in `assets/` makes FUSE mode usable offline from the USB drive.
+If that file is missing, it falls back to the host system `gocryptfs`.
 
-## Any Application
+If FUSE/gocryptfs is unavailable during FUSE-to-DIY migration, ShadowSync logs a warning and continues instead of locking you out.
 
-ShadowSync can work with any application as long as you provide:
+## TOFU App Verification
 
-- the application executable, `.exe`, binary, or AppImage
-- the profile/data folder where that application stores local state
+ShadowSync uses TOFU: Trust On First Use.
 
-Built-in presets and AppImage detection make common apps easier, but uncommon apps may require selecting the profile folder manually.
+When you select an executable, ShadowSync calculates its SHA-256 fingerprint and checks the encrypted registry:
+
+```text
+ShadowSyncStore/user_registry.enc
+```
+
+Verdicts:
+
+- **First-Time Execution Warning**: ShadowSync has never seen the app before. If you trust the source, choose **Trust & Lock**.
+- **Trusted Signature Match**: the app matches the fingerprint previously locked for it.
+- **Corrupted or Tampered**: the app fingerprint changed. ShadowSync blocks execution.
+
+On Linux/Tails, first-run trusted apps launch inside a Bubblewrap sandbox when `bwrap` is available. The sandbox allows the app to write to its selected profile folder and exposes the GUI/session sockets needed for Wayland/X11, D-Bus, PulseAudio, and PipeWire.
 
 ## Manual Files Vault
 
-ShadowSync also includes a cross-platform file vault that is not tied to any app.
+The manual files vault is not tied to any app.
 
-Use:
+Use the GUI buttons:
 
-- **Add Files** to import videos, audio, documents, archives, or any selected files.
-- **Add Folder** to import a whole folder.
-- **Export Files** to decrypt the manual file vault into a folder on Windows, Tails, or Linux.
+- **Add Files**
+- **Add Folder**
+- **Export Files**
 
 Manual files are stored here:
 
@@ -114,42 +111,11 @@ Manual files are stored here:
 ShadowSyncStore/files/manual-files.ssvault
 ```
 
-This vault uses the same portable AES-256-GCM encryption as DIY mode. Exporting files does not wipe the destination folder and avoids overwriting existing files by adding a numeric suffix when needed.
+The vault is portable across Windows and Linux.
 
-## Switching Modes
+## App Detection
 
-Changing modes does not erase data.
-
-- Switching from DIY to FUSE: ShadowSync reads `profile.ssvault`, creates the app's `gocryptfs/` folder, copies the decrypted data into the mounted FUSE filesystem, and keeps `profile.ssvault` as a backup.
-- Switching from FUSE to DIY: on Linux/Tails, ShadowSync mounts the app's `gocryptfs/` folder, creates `profile.ssvault`, and keeps the FUSE folder as a backup.
-
-If FUSE/gocryptfs is unavailable during FUSE-to-DIY migration, ShadowSync logs a warning and continues instead of blocking launch. This prevents old FUSE data from locking you out on a machine that cannot mount it.
-
-The two formats are both stored under the same app folder. They are separate encrypted formats because a normal AES vault file cannot also behave like a live FUSE filesystem without a custom filesystem driver.
-
-## TOFU App Verification
-
-ShadowSync uses TOFU: Trust On First Use. This is similar to SSH host key trust.
-
-The first time you select an executable, ShadowSync calculates its SHA-256 fingerprint and checks the encrypted user registry:
-
-```text
-ShadowSyncStore/user_registry.enc
-```
-
-That registry is encrypted with your master password.
-
-Verdicts:
-
-- **First-Time Execution Warning**: ShadowSync has never seen this app before. If you trust the download source, choose **Trust & Lock**. ShadowSync records the fingerprint and immediately re-encrypts the registry.
-- **Trusted Signature Match**: the executable matches the fingerprint previously locked for this app.
-- **Corrupted or Tampered**: ShadowSync has seen this app before, but the executable fingerprint changed. ShadowSync blocks the executable.
-
-For Linux/Tails, first-run trusted apps are launched inside a Bubblewrap sandbox when `bwrap` is available. The sandbox gives the app write access to its selected profile folder, creates the needed nested profile path inside the isolated home tmpfs, and exposes only the session sockets needed for normal GUI operation such as Wayland/X11, D-Bus, PulseAudio, and PipeWire.
-
-## New App Detection
-
-When ShadowSync starts, it scans for `.AppImage` and `.appimage` files. To avoid heavy I/O on large Ventoy drives, the scan is depth-limited and only checks shallow locations:
+On startup, ShadowSync scans shallow app-friendly folders for `.AppImage` and `.appimage` files:
 
 - the ShadowSync working folder
 - `Apps/`
@@ -157,49 +123,28 @@ When ShadowSync starts, it scans for `.AppImage` and `.appimage` files. To avoid
 - `Downloads/`
 - the user's home `Downloads/`
 
-If it finds an AppImage that does not already have a matching folder under `ShadowSyncStore/apps/`, it asks whether to configure it automatically.
-
-If accepted, ShadowSync fills:
-
-- App name
-- Application path
-- Profile name: `Default`
-- A guessed Linux profile path such as `~/.config/Element`
-
-The guessed profile path is highlighted so you can review it before launching.
-
-## Panic Control
-
-ShadowSync includes a prominent **Panic** button and an in-app `Ctrl+Shift+P` hotkey.
-
-When triggered, ShadowSync:
-
-- Kills the launched child process immediately.
-- Wipes the selected RAM-side profile folder.
-- Attempts to unmount the FUSE bridge if FUSE mode is active.
-- Closes the ShadowSync window.
-
-The hotkey is bound inside the ShadowSync window. A true OS-global hotkey would require extra platform-specific packages.
-
-## Progress Feedback
-
-During expensive encryption, decryption, and migration work, ShadowSync shows an indeterminate progress bar and updates the status indicator so the GUI does not look frozen while PBKDF2 and AES operations are running.
-
-DIY heartbeat checks also pulse a small indicator next to the status area so the user can see that background protection is alive.
+The scan is depth-limited to avoid heavy I/O on large Ventoy drives.
 
 ## Requirements
 
 Python 3.10+ is recommended.
 
-Install the Python dependency:
+Install Python dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-For FUSE mode on Linux/Tails, bundle `assets/gocryptfs` or make sure `gocryptfs` is installed on the host.
+For FUSE mode on Linux/Tails:
 
-For first-run sandboxing on Linux/Tails, install or provide `bwrap`/Bubblewrap. If Bubblewrap is unavailable, ShadowSync logs a warning and launches normally.
+- bundle `assets/gocryptfs`, or
+- install `gocryptfs` on the host
+
+For first-run sandboxing on Linux/Tails:
+
+- install or provide `bwrap` / Bubblewrap
+
+If Bubblewrap is unavailable, ShadowSync logs a warning and launches normally.
 
 ## Run
 
@@ -215,26 +160,28 @@ Linux or Tails:
 python3 shadowsync.py
 ```
 
-## GUI Setup
+## Build Windows EXE
 
-The setup screen asks for:
+```powershell
+.\build_windows.ps1 -InstallTools
+```
 
-- Mode: DIY sync-on-close or on-the-fly FUSE.
-- Storage folder: the single folder on your USB drive.
-- App name: used to separate app data inside the storage folder.
-- Profile name: lets you keep separate identities such as `Default`, `Personal`, or `Work`.
-- Master password: used for the selected encrypted backend.
-- Profile folder: where the app stores its local profile.
-- Application: the executable or AppImage to launch.
+Output:
 
-Built-in profile presets include Session, SimpleX, Signal, Element, Brave, and KeePassXC.
+```text
+dist\ShadowSync.exe
+```
 
-The manual files vault only needs the storage folder and master password.
+Build separately for each OS. The executable is OS-specific, but the `.ssvault` data is portable.
 
 ## Important Notes
 
 - Use a strong master password.
-- DIY mode is the best choice for cross-platform portability.
-- FUSE mode is the best choice for real-time encrypted writes on Linux/Tails.
-- ShadowSync keeps old encrypted mode data as a backup during migration.
-- Cleanup uses fast logical deletion. It does not pretend to securely erase flash media, because SSD/USB wear leveling can preserve old physical sectors. On Tails/tmpfs, RAM-backed data disappears when power is removed.
+- DIY mode is best for cross-platform portability.
+- FUSE mode is best for real-time encrypted writes on Linux/Tails.
+- Cleanup uses fast logical deletion. It does not pretend to securely erase flash media, because SSD/USB wear leveling can preserve old physical sectors.
+- On Tails/tmpfs, RAM-backed data disappears when power is removed.
+
+## License
+
+ShadowSync is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).

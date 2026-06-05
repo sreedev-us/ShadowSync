@@ -1,25 +1,48 @@
+# === Python ===
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 .Python
+
+# === Virtual environments ===
 .venv/
 venv/
 env/
+ENV/
+.env
 
-build/
-dist/
+# === PyInstaller ===
 *.spec
+dist/
+build/
 
+# === IDE / Editor ===
 .idea/
 .vscode/
 .qodo/
+*.swp
+*.swo
+*~
 
+# === ShadowSync runtime data ===
+# Never commit live vaults or encrypted stores
 ShadowSyncStore/
 *.ssvault
 *.enc
 *.tmp
 
+# === OS artifacts ===
 .DS_Store
 Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# === Logs ===
+*.log

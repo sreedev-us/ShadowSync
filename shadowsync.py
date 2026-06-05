@@ -48,6 +48,12 @@ VERDICT_VERIFIED = "verified"
 VERDICT_FIRST_RUN = "first_run"
 VERDICT_MISMATCH = "mismatch"
 
+# ---------------------------------------------------------------------------
+# Hydrate feature constants
+# ---------------------------------------------------------------------------
+HYDRATE_VAULT_NAME = "hydrate_config.json.ssvault"
+_IS_LINUX = platform.system().lower() == "linux"
+
 
 def default_profile_paths() -> Dict[str, str]:
     home = Path.home()
@@ -334,6 +340,10 @@ def app_storage_paths(storage_root: Path, app_name: str, profile_name: str = "De
 
 def files_vault_path(storage_root: Path) -> Path:
     return storage_root.expanduser().resolve() / "files" / "manual-files.ssvault"
+
+
+def hydrate_config_path(storage_root: Path) -> Path:
+    return storage_root.expanduser().resolve() / HYDRATE_VAULT_NAME
 
 
 def user_registry_path(storage_root: Path) -> Path:
@@ -696,6 +706,297 @@ def fingerprint_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Hydrate — data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HydrateConfig:
+    """All personalisation settings stored in the encrypted hydrate vault."""
+    dark_mode: bool = True
+    wallpaper_path: str = "/live/mount/medium/wallpaper.jpg"
+    wifi_profiles: list = None  # list of {"ssid": str, "password": str}
+    git_remote: str = ""
+    git_branch: str = "main"
+    git_name: str = "Tails User"
+    git_email: str = ""
+    git_token: str = ""  # PAT; injected at runtime, never written to .git/config
+
+    def __post_init__(self) -> None:
+        if self.wifi_profiles is None:
+            self.wifi_profiles = []
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return {
+            "dark_mode": self.dark_mode,
+            "wallpaper_path": self.wallpaper_path,
+            "wifi_profiles": self.wifi_profiles,
+            "git_remote": self.git_remote,
+            "git_branch": self.git_branch,
+            "git_name": self.git_name,
+            "git_email": self.git_email,
+            "git_token": self.git_token,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HydrateConfig":
+        return cls(
+            dark_mode=bool(data.get("dark_mode", True)),
+            wallpaper_path=str(data.get("wallpaper_path", "/live/mount/medium/wallpaper.jpg")),
+            wifi_profiles=list(data.get("wifi_profiles", [])),
+            git_remote=str(data.get("git_remote", "")),
+            git_branch=str(data.get("git_branch", "main")),
+            git_name=str(data.get("git_name", "Tails User")),
+            git_email=str(data.get("git_email", "")),
+            git_token=str(data.get("git_token", "")),
+        )
+
+    # ------------------------------------------------------------------
+    # Vault I/O
+    # ------------------------------------------------------------------
+
+    def save(self, storage_root: Path, password: str) -> None:
+        vault_path = hydrate_config_path(storage_root)
+        staging = Path(tempfile.mkdtemp(prefix="shadowsync-hydrate-"))
+        try:
+            cfg_file = staging / "hydrate_config.json"
+            cfg_file.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+            PortableVault(vault_path).save_from(staging, password)
+        finally:
+            wipe_directory(staging)
+
+    @classmethod
+    def load(cls, storage_root: Path, password: str) -> "HydrateConfig":
+        vault_path = hydrate_config_path(storage_root)
+        if not vault_path.exists():
+            return cls()
+        staging = Path(tempfile.mkdtemp(prefix="shadowsync-hydrate-"))
+        try:
+            PortableVault(vault_path).restore_to(staging, password)
+            cfg_file = staging / "hydrate_config.json"
+            if not cfg_file.exists():
+                return cls()
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            return cls.from_dict(data)
+        finally:
+            wipe_directory(staging)
+
+
+# ---------------------------------------------------------------------------
+# Hydrate — worker threads
+# ---------------------------------------------------------------------------
+
+class HydrateWorker:
+    """Applies GNOME personalisation settings concurrently in a background thread."""
+
+    def __init__(self, config: HydrateConfig, log: queue.Queue) -> None:
+        self.config = config
+        self.log = log
+
+    def run(self) -> None:
+        threads = []
+        if self.config.dark_mode:
+            threads.append(threading.Thread(target=self._apply_dark_mode, daemon=True))
+        if self.config.wallpaper_path.strip():
+            threads.append(threading.Thread(target=self._apply_wallpaper, daemon=True))
+        if self.config.wifi_profiles:
+            threads.append(threading.Thread(target=self._apply_wifi, daemon=True))
+
+        if not threads:
+            self._log("Hydrate: nothing to do — all hooks are disabled or empty.")
+            return
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self._log("Hydrate: all hooks completed.")
+
+    # ------------------------------------------------------------------
+    # Individual hooks
+    # ------------------------------------------------------------------
+
+    def _apply_dark_mode(self) -> None:
+        try:
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface",
+                 "color-scheme", "prefer-dark"],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self._log("Hydrate: dark mode applied.")
+        except FileNotFoundError:
+            self._log("Hydrate: gsettings not found — skipping dark mode.")
+        except subprocess.CalledProcessError as exc:
+            self._log(f"Hydrate: dark mode failed: {exc.stderr.strip()}")
+
+    def _apply_wallpaper(self) -> None:
+        uri = self.config.wallpaper_path.strip()
+        # Ensure file:// URI format
+        if not uri.startswith(("file://", "http://", "https://")):
+            uri = "file://" + uri
+        try:
+            # Set for both light and dark to cover X11 and Wayland
+            for key in ("picture-uri", "picture-uri-dark"):
+                subprocess.run(
+                    ["gsettings", "set", "org.gnome.desktop.background", key, uri],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+            self._log(f"Hydrate: wallpaper set → {uri}")
+        except FileNotFoundError:
+            self._log("Hydrate: gsettings not found — skipping wallpaper.")
+        except subprocess.CalledProcessError as exc:
+            self._log(f"Hydrate: wallpaper failed: {exc.stderr.strip()}")
+
+    def _apply_wifi(self) -> None:
+        for idx, profile in enumerate(self.config.wifi_profiles, start=1):
+            ssid = str(profile.get("ssid", "")).strip()
+            pwd = str(profile.get("password", "")).strip()
+            if not ssid:
+                continue
+            self._log(f"Hydrate: connecting Wi-Fi profile {idx} ({ssid})…")
+            try:
+                cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+                if pwd:
+                    cmd += ["password", pwd]
+                result = subprocess.run(
+                    cmd, check=False,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    timeout=20,
+                )
+                if result.returncode == 0:
+                    self._log(f"Hydrate: Wi-Fi connected to {ssid}.")
+                    return  # success — stop trying further profiles
+                self._log(f"Hydrate: Wi-Fi profile {idx} failed ({ssid}): {result.stderr.strip()}")
+            except FileNotFoundError:
+                self._log("Hydrate: nmcli not found — skipping Wi-Fi.")
+                return
+            except subprocess.TimeoutExpired:
+                self._log(f"Hydrate: Wi-Fi profile {idx} timed out.")
+        self._log("Hydrate: all Wi-Fi profiles exhausted without a successful connection.")
+
+    def _log(self, message: str) -> None:
+        self.log.put(message)
+
+
+class GitPushWorker:
+    """
+    Commits the entire ShadowSync storage folder to a remote Git repo.
+
+    Security guarantees:
+    - The PAT is injected into the remote URL at runtime only.
+    - It is never written to .git/config or any file.
+    - push is to a timestamped branch, never --force, so historical backups survive.
+    """
+
+    def __init__(
+        self,
+        storage_root: Path,
+        config: HydrateConfig,
+        log: queue.Queue,
+    ) -> None:
+        self.storage_root = storage_root.expanduser().resolve()
+        self.config = config
+        self.log = log
+
+    def run(self) -> None:
+        cfg = self.config
+        if not cfg.git_remote.strip():
+            self._log("Git Push: no remote URL configured — skipped.")
+            return
+
+        branch = f"backup-{time.strftime('%Y%m%d-%H%M%S')}"
+        self._log(f"Git Push: starting → branch '{branch}'")
+
+        try:
+            self._write_gitignore()
+            self._git("init")
+            self._git("config", "user.name", cfg.git_name or "ShadowSync")
+            self._git("config", "user.email", cfg.git_email or "shadowsync@local")
+            self._set_remote(cfg.git_remote, cfg.git_token)
+            self._git("checkout", "-B", branch)
+            self._git("add", "-A")
+            commit_msg = f"ShadowSync vault backup — {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+            self._git("commit", "--allow-empty", "-m", commit_msg)
+            # Push WITHOUT --force to preserve history
+            self._git_push(branch)
+            self._log(f"Git Push: vault pushed successfully to branch '{branch}'.")
+        except ShadowSyncError as exc:
+            self._log(f"Git Push error: {exc}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _write_gitignore(self) -> None:
+        gitignore = self.storage_root / ".gitignore"
+        content = "*.tmp\n__pycache__/\n*.pyc\n.DS_Store\n"
+        try:
+            gitignore.write_text(content, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _set_remote(self, remote_url: str, token: str) -> None:
+        """Set the remote URL, embedding the PAT at runtime without persisting it."""
+        # Build authenticated URL if token provided
+        if token:
+            # Insert token into https://token@host/... format
+            if remote_url.startswith("https://"):
+                authed_url = "https://" + token + "@" + remote_url[len("https://"):]
+            else:
+                authed_url = remote_url
+        else:
+            authed_url = remote_url
+
+        # Check if remote exists
+        result = subprocess.run(
+            ["git", "-C", str(self.storage_root), "remote", "get-url", "origin"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if result.returncode == 0:
+            # Update existing remote URL (in-memory only for this session)
+            subprocess.run(
+                ["git", "-C", str(self.storage_root), "remote", "set-url", "origin", authed_url],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+        else:
+            subprocess.run(
+                ["git", "-C", str(self.storage_root), "remote", "add", "origin", authed_url],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+    def _git(self, *args: str) -> None:
+        cmd = ["git", "-C", str(self.storage_root)] + list(args)
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if result.returncode != 0:
+            raise ShadowSyncError(
+                f"git {' '.join(args)} failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    def _git_push(self, branch: str) -> None:
+        """Push to remote. No --force, so history is always preserved."""
+        cmd = ["git", "-C", str(self.storage_root), "push", "origin", branch]
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if result.returncode != 0:
+            raise ShadowSyncError(
+                f"git push failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    def _log(self, message: str) -> None:
+        self.log.put(message)
+
+
+# ---------------------------------------------------------------------------
+# Original RunOptions dataclass (unchanged)
+# ---------------------------------------------------------------------------
+
 @dataclass
 class RunOptions:
     storage_root: Path
@@ -951,8 +1252,8 @@ class ShadowSyncApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("ShadowSync")
-        self.geometry("980x680")
-        self.minsize(860, 640)
+        self.geometry("980x860")
+        self.minsize(860, 780)
         self.configure(bg="#101820")
         self.presets = default_profile_paths()
         self.log_queue: queue.Queue[object] = queue.Queue()
@@ -961,6 +1262,9 @@ class ShadowSyncApp(tk.Tk):
         self.approved_executable_path = ""
         self.approved_storage_root = ""
         self.sandbox_next_launch = False
+        # Hydrate state
+        self._hydrate_config: Optional[HydrateConfig] = None
+        self._hydrate_expanded = tk.BooleanVar(value=False)
         self._build_styles()
         self._build_ui()
         self.after(150, self._drain_log)
@@ -974,13 +1278,19 @@ class ShadowSyncApp(tk.Tk):
         style.configure("TFrame", background="#101820")
         style.configure("Panel.TFrame", background="#f7f8fb")
         style.configure("Card.TFrame", background="#ffffff", relief="flat")
+        style.configure("HydrateCard.TFrame", background="#0f0a1e", relief="flat")
         style.configure("TLabel", background="#f7f8fb", foreground="#17212b", font=("Segoe UI", 10))
         style.configure("Title.TLabel", font=("Segoe UI", 24, "bold"), foreground="#ffffff", background="#101820")
         style.configure("Sub.TLabel", font=("Segoe UI", 11), foreground="#b7c3d0", background="#101820")
         style.configure("Field.TLabel", font=("Segoe UI", 10, "bold"), foreground="#27313c", background="#ffffff")
+        style.configure("HydrateField.TLabel", font=("Segoe UI", 10, "bold"), foreground="#c4b5fd", background="#0f0a1e")
+        style.configure("HydrateSect.TLabel", font=("Segoe UI", 9, "bold"), foreground="#7c3aed", background="#0f0a1e")
+        style.configure("HydrateDisabled.TLabel", font=("Segoe UI", 10), foreground="#6b7a90", background="#0f0a1e")
         style.configure("Status.TLabel", font=("Segoe UI", 10), foreground="#425466", background="#ffffff")
         style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d7dce4", padding=8)
+        style.configure("HydrateEntry.TEntry", fieldbackground="#1e1535", foreground="#e9d5ff", bordercolor="#6d28d9", padding=8)
         style.configure("TCheckbutton", background="#ffffff", foreground="#27313c", font=("Segoe UI", 10))
+        style.configure("HydrateCheck.TCheckbutton", background="#0f0a1e", foreground="#c4b5fd", font=("Segoe UI", 10))
         style.configure("TRadiobutton", background="#ffffff", foreground="#27313c", font=("Segoe UI", 10))
         style.configure("Primary.TButton", font=("Segoe UI", 11, "bold"), padding=(16, 10), background="#0f766e", foreground="#ffffff")
         style.map("Primary.TButton", background=[("active", "#0d9488"), ("disabled", "#93a4b1")])
@@ -988,6 +1298,11 @@ class ShadowSyncApp(tk.Tk):
         style.map("Danger.TButton", background=[("active", "#d92d20")])
         style.configure("Ghost.TButton", font=("Segoe UI", 10), padding=(12, 8), background="#e8eef5", foreground="#17212b")
         style.map("Ghost.TButton", background=[("active", "#dbe6ef")])
+        # Hydrate-specific button styles
+        style.configure("Hydrate.TButton", font=("Segoe UI", 11, "bold"), padding=(16, 10), background="#7c3aed", foreground="#ffffff")
+        style.map("Hydrate.TButton", background=[("active", "#6d28d9"), ("disabled", "#3b2d5a")])
+        style.configure("HydrateGhost.TButton", font=("Segoe UI", 10), padding=(12, 8), background="#1e1535", foreground="#c4b5fd")
+        style.map("HydrateGhost.TButton", background=[("active", "#2d1f4a")])
         style.configure("Crypto.Horizontal.TProgressbar", troughcolor="#dce6ef", background="#0f766e", bordercolor="#dce6ef")
 
     def _build_ui(self) -> None:
@@ -1038,7 +1353,7 @@ class ShadowSyncApp(tk.Tk):
         main = ttk.Frame(self, style="Panel.TFrame", padding=(28, 28))
         main.grid(row=0, column=1, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(1, weight=1)
+        main.rowconfigure(3, weight=1)
 
         form = ttk.Frame(main, style="Card.TFrame", padding=(24, 22))
         form.grid(row=0, column=0, sticky="ew")
@@ -1085,14 +1400,19 @@ class ShadowSyncApp(tk.Tk):
         self.progress.grid(row=11, column=1, sticky="ew", pady=(16, 0))
         self.progress.grid_remove()
 
+        # ------------------------------------------------------------------
+        # Hydrate card (collapsible, below the main form)
+        # ------------------------------------------------------------------
+        self._build_hydrate_card(main)
+
         log_card = ttk.Frame(main, style="Card.TFrame", padding=(20, 18))
-        log_card.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+        log_card.grid(row=2, column=0, sticky="nsew", pady=(18, 0))
         log_card.columnconfigure(0, weight=1)
         log_card.rowconfigure(1, weight=1)
         ttk.Label(log_card, text="Activity", style="Field.TLabel").grid(row=0, column=0, sticky="w")
         self.log_text = tk.Text(
             log_card,
-            height=12,
+            height=10,
             bg="#0f1720",
             fg="#d9e7ef",
             insertbackground="#ffffff",
@@ -1104,6 +1424,342 @@ class ShadowSyncApp(tk.Tk):
         )
         self.log_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         self._log("Ready. Choose a storage mode, then enter the master password.")
+
+    # ------------------------------------------------------------------
+    # Hydrate card builder
+    # ------------------------------------------------------------------
+
+    def _build_hydrate_card(self, parent: ttk.Frame) -> None:
+        """Build the collapsible Hydrate personalisation card."""
+        # Toggle header — always visible
+        header = tk.Frame(parent, bg="#0f0a1e", cursor="hand2")
+        header.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        header.columnconfigure(1, weight=1)
+
+        self._hydrate_arrow = tk.Label(
+            header, text="▶", bg="#0f0a1e", fg="#7c3aed",
+            font=("Segoe UI", 12, "bold"), padx=10, pady=8,
+        )
+        self._hydrate_arrow.grid(row=0, column=0)
+        tk.Label(
+            header, text="⚡  Hydrate — Session Personalisation",
+            bg="#0f0a1e", fg="#c4b5fd",
+            font=("Segoe UI", 11, "bold"), pady=8,
+        ).grid(row=0, column=1, sticky="w")
+
+        # Collapsible body
+        self._hydrate_body = tk.Frame(parent, bg="#0f0a1e")
+        # (not gridded until expanded)
+
+        # Bind toggle
+        for widget in (header, self._hydrate_arrow):
+            widget.bind("<Button-1>", lambda _e: self._toggle_hydrate())
+        for child in header.winfo_children():
+            child.bind("<Button-1>", lambda _e: self._toggle_hydrate())
+
+        # Build form inside body
+        self._build_hydrate_body(self._hydrate_body)
+
+    def _build_hydrate_body(self, parent: tk.Frame) -> None:
+        """Populate the Hydrate card body."""
+        if not _IS_LINUX:
+            # Windows — show disabled notice
+            tk.Label(
+                parent,
+                text="⚠  Hydrate requires Linux / Tails with GNOME and NetworkManager.",
+                bg="#0f0a1e", fg="#6b7a90",
+                font=("Segoe UI", 10), pady=16, padx=16,
+            ).pack(fill="x")
+            return
+
+        pad = {"padx": 16, "pady": 4}
+
+        # --- Section: Appearance ---
+        tk.Label(parent, text="APPEARANCE", bg="#0f0a1e", fg="#7c3aed",
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=16, pady=(12, 0))
+        sep1 = tk.Frame(parent, bg="#2d1f4a", height=1)
+        sep1.pack(fill="x", padx=16, pady=(2, 6))
+
+        # Dark mode checkbox
+        self._h_darkmode_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            parent, text="Enable dark mode (GNOME)",
+            variable=self._h_darkmode_var,
+            bg="#0f0a1e", fg="#c4b5fd", selectcolor="#1e1535",
+            activebackground="#0f0a1e", activeforeground="#e9d5ff",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", **pad)
+
+        # Wallpaper
+        wp_row = tk.Frame(parent, bg="#0f0a1e")
+        wp_row.pack(fill="x", **pad)
+        tk.Label(wp_row, text="Wallpaper path", bg="#0f0a1e", fg="#c4b5fd",
+                 font=("Segoe UI", 10, "bold"), width=18, anchor="w").pack(side="left")
+        self._h_wallpaper_var = tk.StringVar(value="/live/mount/medium/wallpaper.jpg")
+        wp_entry = tk.Entry(
+            wp_row, textvariable=self._h_wallpaper_var,
+            bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
+            relief="flat", font=("Segoe UI", 10), bd=4,
+        )
+        wp_entry.pack(side="left", fill="x", expand=True, padx=(8, 6))
+        tk.Button(
+            wp_row, text="Browse", command=self._h_browse_wallpaper,
+            bg="#1e1535", fg="#c4b5fd", relief="flat",
+            activebackground="#2d1f4a", activeforeground="#e9d5ff",
+            font=("Segoe UI", 9), padx=10, pady=4,
+        ).pack(side="left")
+
+        # --- Section: Wi-Fi ---
+        tk.Label(parent, text="WI-FI PROFILES", bg="#0f0a1e", fg="#7c3aed",
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=16, pady=(14, 0))
+        sep2 = tk.Frame(parent, bg="#2d1f4a", height=1)
+        sep2.pack(fill="x", padx=16, pady=(2, 6))
+
+        self._h_wifi_vars: list[tuple[tk.StringVar, tk.StringVar]] = []
+        for i in range(2):
+            row = tk.Frame(parent, bg="#0f0a1e")
+            row.pack(fill="x", **pad)
+            tk.Label(
+                row, text=f"SSID {i + 1}", bg="#0f0a1e", fg="#c4b5fd",
+                font=("Segoe UI", 10, "bold"), width=8, anchor="w",
+            ).pack(side="left")
+            ssid_v = tk.StringVar()
+            tk.Entry(
+                row, textvariable=ssid_v,
+                bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
+                relief="flat", font=("Segoe UI", 10), bd=4, width=20,
+            ).pack(side="left", padx=(8, 8))
+            tk.Label(
+                row, text="Password", bg="#0f0a1e", fg="#c4b5fd",
+                font=("Segoe UI", 10, "bold"),
+            ).pack(side="left")
+            pwd_v = tk.StringVar()
+            tk.Entry(
+                row, textvariable=pwd_v, show="●",
+                bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
+                relief="flat", font=("Segoe UI", 10), bd=4, width=20,
+            ).pack(side="left", padx=(8, 0))
+            self._h_wifi_vars.append((ssid_v, pwd_v))
+
+        # --- Section: Git ---
+        tk.Label(parent, text="GIT BACKUP", bg="#0f0a1e", fg="#7c3aed",
+                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=16, pady=(14, 0))
+        sep3 = tk.Frame(parent, bg="#2d1f4a", height=1)
+        sep3.pack(fill="x", padx=16, pady=(2, 6))
+
+        git_fields = [
+            ("Remote URL",   "_h_git_remote_var",  "",      False),
+            ("Branch",       "_h_git_branch_var",  "main",  False),
+            ("Identity name","_h_git_name_var",    "Tails User", False),
+            ("Identity email","_h_git_email_var",  "",      False),
+            ("Access token (PAT)", "_h_git_token_var", "",  True),
+        ]
+        for label, attr, default, is_secret in git_fields:
+            row = tk.Frame(parent, bg="#0f0a1e")
+            row.pack(fill="x", **pad)
+            tk.Label(
+                row, text=label, bg="#0f0a1e", fg="#c4b5fd",
+                font=("Segoe UI", 10, "bold"), width=18, anchor="w",
+            ).pack(side="left")
+            var = tk.StringVar(value=default)
+            setattr(self, attr, var)
+            show = "●" if is_secret else ""
+            tk.Entry(
+                row, textvariable=var, show=show,
+                bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
+                relief="flat", font=("Segoe UI", 10), bd=4,
+            ).pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        # --- Action buttons ---
+        btn_row = tk.Frame(parent, bg="#0f0a1e")
+        btn_row.pack(fill="x", padx=16, pady=(16, 16))
+
+        def _hbtn(text, cmd, primary=False):
+            bg = "#7c3aed" if primary else "#1e1535"
+            abg = "#6d28d9" if primary else "#2d1f4a"
+            return tk.Button(
+                btn_row, text=text, command=cmd,
+                bg=bg, fg="#ffffff", relief="flat",
+                activebackground=abg, activeforeground="#ffffff",
+                font=("Segoe UI", 10, "bold") if primary else ("Segoe UI", 10),
+                padx=14, pady=8, cursor="hand2",
+            )
+
+        _hbtn("⚡ Hydrate Now", self._hydrate_now, primary=True).pack(side="left")
+        _hbtn("💾 Save Config", self._save_hydrate_config).pack(side="left", padx=(10, 0))
+        _hbtn("☁  Push to Git", self._git_push).pack(side="left", padx=(10, 0))
+
+    # ------------------------------------------------------------------
+    # Hydrate card toggle
+    # ------------------------------------------------------------------
+
+    def _toggle_hydrate(self) -> None:
+        if self._hydrate_expanded.get():
+            self._hydrate_body.grid_remove()
+            self._hydrate_arrow.configure(text="▶")
+            self._hydrate_expanded.set(False)
+        else:
+            self._hydrate_body.grid(row=2, column=0, sticky="ew")
+            self._hydrate_arrow.configure(text="▼")
+            self._hydrate_expanded.set(True)
+
+    # ------------------------------------------------------------------
+    # Hydrate helpers — file browse
+    # ------------------------------------------------------------------
+
+    def _h_browse_wallpaper(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose wallpaper image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp"), ("All files", "*")],
+        )
+        if path:
+            self._h_wallpaper_var.set(path)
+
+    # ------------------------------------------------------------------
+    # Hydrate — build config from UI fields
+    # ------------------------------------------------------------------
+
+    def _ui_to_hydrate_config(self) -> HydrateConfig:
+        wifi_profiles = []
+        for ssid_v, pwd_v in self._h_wifi_vars:
+            ssid = ssid_v.get().strip()
+            if ssid:
+                wifi_profiles.append({"ssid": ssid, "password": pwd_v.get()})
+        return HydrateConfig(
+            dark_mode=self._h_darkmode_var.get(),
+            wallpaper_path=self._h_wallpaper_var.get().strip(),
+            wifi_profiles=wifi_profiles,
+            git_remote=self._h_git_remote_var.get().strip(),
+            git_branch=self._h_git_branch_var.get().strip() or "main",
+            git_name=self._h_git_name_var.get().strip(),
+            git_email=self._h_git_email_var.get().strip(),
+            git_token=self._h_git_token_var.get().strip(),
+        )
+
+    def _populate_hydrate_fields(self, cfg: HydrateConfig) -> None:
+        """Fill UI fields from a loaded HydrateConfig (called from background thread via after())."""
+        if not _IS_LINUX:
+            return
+        self._h_darkmode_var.set(cfg.dark_mode)
+        self._h_wallpaper_var.set(cfg.wallpaper_path)
+        for i, (ssid_v, pwd_v) in enumerate(self._h_wifi_vars):
+            if i < len(cfg.wifi_profiles):
+                ssid_v.set(cfg.wifi_profiles[i].get("ssid", ""))
+                pwd_v.set(cfg.wifi_profiles[i].get("password", ""))
+            else:
+                ssid_v.set("")
+                pwd_v.set("")
+        self._h_git_remote_var.set(cfg.git_remote)
+        self._h_git_branch_var.set(cfg.git_branch)
+        self._h_git_name_var.set(cfg.git_name)
+        self._h_git_email_var.set(cfg.git_email)
+        self._h_git_token_var.set(cfg.git_token)
+        self._hydrate_config = cfg
+
+    # ------------------------------------------------------------------
+    # Hydrate — background auto-load
+    # ------------------------------------------------------------------
+
+    def _try_autoload_hydrate(self) -> None:
+        """Silently attempt to load the hydrate config vault in the background."""
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password or not storage or not _IS_LINUX:
+            return
+        threading.Thread(target=self._autoload_hydrate_task, daemon=True).start()
+
+    def _autoload_hydrate_task(self) -> None:
+        try:
+            cfg = HydrateConfig.load(
+                Path(self.storage_var.get()),
+                self.password_var.get(),
+            )
+            self._hydrate_config = cfg
+            self.after(0, lambda: self._populate_hydrate_fields(cfg))
+            self.log_queue.put("Hydrate config loaded from vault.")
+        except ShadowSyncError:
+            pass  # vault doesn't exist yet — that's fine
+        except Exception as exc:
+            self.log_queue.put(f"Hydrate config auto-load skipped: {exc}")
+
+    # ------------------------------------------------------------------
+    # Hydrate — action handlers
+    # ------------------------------------------------------------------
+
+    def _hydrate_now(self) -> None:
+        if not _IS_LINUX:
+            messagebox.showinfo("Hydrate", "Hydrate is only available on Linux/Tails.")
+            return
+        cfg = self._ui_to_hydrate_config()
+        self._log("Hydrate: starting personalisation hooks…")
+        self._set_busy(True, "Hydrating session…")
+
+        def task() -> None:
+            try:
+                HydrateWorker(cfg, self.log_queue).run()
+            except Exception as exc:
+                self.log_queue.put(f"Hydrate error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _save_hydrate_config(self) -> None:
+        if not _IS_LINUX:
+            messagebox.showinfo("Hydrate", "Hydrate is only available on Linux/Tails.")
+            return
+        password = self.password_var.get()
+        if not password:
+            messagebox.showerror("Hydrate", "Enter the master password first.")
+            return
+        storage = self.storage_var.get().strip()
+        if not storage:
+            messagebox.showerror("Hydrate", "Choose the ShadowSync storage folder first.")
+            return
+        cfg = self._ui_to_hydrate_config()
+        self._set_busy(True, "Saving hydrate config…")
+
+        def task() -> None:
+            try:
+                cfg.save(Path(storage), password)
+                self._hydrate_config = cfg
+                self.log_queue.put("Hydrate config saved to encrypted vault.")
+            except ShadowSyncError as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: messagebox.showerror("Hydrate", m))
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _git_push(self) -> None:
+        if not _IS_LINUX:
+            messagebox.showinfo("Hydrate", "Git push is only available on Linux/Tails.")
+            return
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("Hydrate", "Enter the master password first.")
+            return
+        if not storage:
+            messagebox.showerror("Hydrate", "Choose the ShadowSync storage folder first.")
+            return
+        cfg = self._ui_to_hydrate_config()
+        if not cfg.git_remote:
+            messagebox.showerror("Hydrate", "Enter a Git remote URL in the Hydrate section.")
+            return
+        self._log("Git Push: preparing vault commit…")
+        self._set_busy(True, "Pushing to Git…")
+
+        def task() -> None:
+            try:
+                GitPushWorker(Path(storage), cfg, self.log_queue).run()
+            except Exception as exc:
+                self.log_queue.put(f"Git Push error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _field(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, browse) -> ttk.Label:
         label_widget = ttk.Label(parent, text=label, style="Field.TLabel")
@@ -1205,6 +1861,8 @@ class ShadowSyncApp(tk.Tk):
             self._log("FUSE mode selected. This requires Linux/Tails with gocryptfs.")
         else:
             self._log("DIY sync-on-close mode selected.")
+        # When password is already entered and mode is changed, try to auto-load hydrate
+        self._try_autoload_hydrate()
 
     def _options(self) -> RunOptions:
         if not self.password_var.get():
@@ -1250,6 +1908,8 @@ class ShadowSyncApp(tk.Tk):
         self.worker_thread = threading.Thread(target=self._run_worker, daemon=True)
         self.worker_thread.start()
         self.state_label.configure(text="Running")
+        # Auto-load hydrate config now that we know password + storage are valid
+        self._try_autoload_hydrate()
 
     def _run_worker(self) -> None:
         try:

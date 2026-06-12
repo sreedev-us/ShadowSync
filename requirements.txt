@@ -1,1 +1,4 @@
 cryptography>=42
+customtkinter>=5.2.0
+# Optional: Windows shutdown signal handling (gracefully skipped if absent)
+# pywin32>=306

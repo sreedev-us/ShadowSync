@@ -9,34 +9,49 @@ through PBKDF2-HMAC-SHA256.
 
 from __future__ import annotations
 
+import atexit
+import base64
 import io
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
 import threading
+import sys
 import time
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 try:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-except ImportError:  # pragma: no cover - shown through the GUI bootstrap.
+except ImportError:  # pragma: no cover
     AESGCM = None  # type: ignore[assignment]
+
+try:
+    import win32api
+    import win32con
+    _HAS_WIN32 = True
+except ImportError:
+    _HAS_WIN32 = False
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import customtkinter as ctk
 
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
 MAGIC = b"SHADOWSYNC1\n"
 KDF_ITERATIONS = 390_000
@@ -52,7 +67,10 @@ VERDICT_MISMATCH = "mismatch"
 # Hydrate feature constants
 # ---------------------------------------------------------------------------
 HYDRATE_VAULT_NAME = "hydrate_config.json.ssvault"
+OS_SETTINGS_VAULT_NAME = "os_settings/os_state.ssvault"
+FILES_VAULT_SUBPATH = "ShadowSyncFiles/manual-files.ssvault"
 _IS_LINUX = platform.system().lower() == "linux"
+_IS_WINDOWS = platform.system().lower() == "windows"
 
 
 def default_profile_paths() -> Dict[str, str]:
@@ -103,6 +121,51 @@ class SecurityVerdict:
         return "First-Time Execution Warning"
 
 
+# ---------------------------------------------------------------------------
+# Drive discovery
+# ---------------------------------------------------------------------------
+
+def list_mounted_drives() -> List[str]:
+    """Return all mountable drive roots on the current platform."""
+    drives: List[str] = []
+    if _IS_WINDOWS:
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if Path(drive).exists():
+                drives.append(drive)
+    else:
+        mount_bases = [Path("/media"), Path("/mnt"), Path("/run/media")]
+        for base in mount_bases:
+            if not base.exists():
+                continue
+            try:
+                if base == Path("/run/media"):
+                    for user_dir in base.iterdir():
+                        if user_dir.is_dir():
+                            for drive in user_dir.iterdir():
+                                if drive.is_dir():
+                                    drives.append(str(drive))
+                else:
+                    for sub in base.iterdir():
+                        if sub.is_dir():
+                            drives.append(str(sub))
+            except (OSError, PermissionError):
+                pass
+        if not drives:
+            drives.append(str(Path.home()))
+    return drives
+
+
+def files_vault_path_for_drive(drive: str) -> Path:
+    """Return the file-vault path on an arbitrary drive/mount point."""
+    return Path(drive) / FILES_VAULT_SUBPATH
+
+
+# ---------------------------------------------------------------------------
+# Vault helpers
+# ---------------------------------------------------------------------------
+
 class PortableVault:
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser().resolve()
@@ -145,6 +208,18 @@ class PortableVault:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_bytes(encrypted)
         os.replace(tmp, self.path)
+
+    def save_bytes(self, data: bytes, password: str) -> None:
+        """Encrypt raw bytes (for non-folder payloads like JSON)."""
+        encrypted = self._encrypt(data, password)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_bytes(encrypted)
+        os.replace(tmp, self.path)
+
+    def load_bytes(self, password: str) -> bytes:
+        """Decrypt and return raw bytes."""
+        return self._decrypt(password)
 
     def _encrypt(self, plaintext: bytes, password: str) -> bytes:
         salt = os.urandom(16)
@@ -258,7 +333,6 @@ class GocryptfsBridge:
         if platform.system().lower() == "windows":
             raise ShadowSyncError("FUSE mode requires Linux/Tails with gocryptfs installed.")
         gocryptfs = resolve_gocryptfs_binary()
-
         self.cipher_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_mountpoint_empty()
         with self._passfile() as passfile:
@@ -325,6 +399,10 @@ class GocryptfsBridge:
             raise ShadowSyncError(completed.stderr.strip() or f"Command failed: {' '.join(command)}")
 
 
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
 def app_storage_paths(storage_root: Path, app_name: str, profile_name: str = "Default") -> Dict[str, Path]:
     safe_name = sanitize_app_name(app_name)
     safe_profile = sanitize_app_name(profile_name)
@@ -346,9 +424,140 @@ def hydrate_config_path(storage_root: Path) -> Path:
     return storage_root.expanduser().resolve() / HYDRATE_VAULT_NAME
 
 
+def os_settings_vault_path(storage_root: Path) -> Path:
+    return storage_root.expanduser().resolve() / OS_SETTINGS_VAULT_NAME
+
+
 def user_registry_path(storage_root: Path) -> Path:
     return storage_root.expanduser().resolve() / "user_registry.enc"
 
+
+def is_valid_shadowsync_store(path: Path) -> bool:
+    """Check if a directory looks like a valid ShadowSync storage root."""
+    if not path.is_dir():
+        return False
+    markers = [
+        path / "apps",
+        path / "files",
+        path / "os_settings",
+        path / "user_registry.enc",
+        path / HYDRATE_VAULT_NAME,
+    ]
+    has_marker = any(m.exists() for m in markers)
+    if has_marker:
+        return True
+    try:
+        for item in path.iterdir():
+            if item.is_file() and item.suffix == ".ssvault":
+                return True
+            if item.is_dir():
+                try:
+                    for sub in item.iterdir():
+                        if sub.is_file() and sub.suffix == ".ssvault":
+                            return True
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+    return False
+
+
+def find_shadowsync_stores(max_depth: int = 3) -> list[Path]:
+    """Scan all drives (Windows) or mount points (Linux) for ShadowSyncStore directories."""
+    found: list[Path] = []
+    seen: set[Path] = set()
+    system = platform.system().lower()
+    scan_roots: list[Path] = []
+
+    if system == "windows":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:\\")
+            if drive.exists():
+                scan_roots.append(drive)
+    else:
+        mount_bases = [Path("/media"), Path("/mnt"), Path("/run/media"), Path.home()]
+        for base in mount_bases:
+            if base.exists():
+                if base == Path("/run/media"):
+                    try:
+                        for user_dir in base.iterdir():
+                            if user_dir.is_dir():
+                                for drive in user_dir.iterdir():
+                                    if drive.is_dir():
+                                        scan_roots.append(drive)
+                    except (OSError, PermissionError):
+                        pass
+                elif base in (Path("/media"), Path("/mnt")):
+                    try:
+                        for sub in base.iterdir():
+                            if sub.is_dir():
+                                scan_roots.append(sub)
+                    except (OSError, PermissionError):
+                        pass
+                else:
+                    scan_roots.append(base)
+        scan_roots.append(Path.cwd().anchor and Path(Path.cwd().anchor) or Path.cwd())
+
+    cwd = Path.cwd()
+    prioritized = [cwd]
+    for root in scan_roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved not in seen and resolved != cwd.resolve():
+            prioritized.append(resolved)
+            seen.add(resolved)
+
+    skipped = {
+        ".git", "__pycache__", "node_modules", "System Volume Information",
+        "$RECYCLE.BIN", "$Recycle.Bin", "lost+found", "Windows", "Program Files",
+        "Program Files (x86)", "ProgramData", "Recovery", ".Trash",
+        "AppData", ".local", ".cache", ".config",
+    }
+
+    def _scan_dir(directory: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            for entry in directory.iterdir():
+                if not entry.is_dir():
+                    continue
+                if entry.name in skipped:
+                    continue
+                if entry.name == "ShadowSyncStore" or entry.name.lower() == "shadowsyncstore":
+                    resolved = entry.resolve()
+                    if resolved not in seen and is_valid_shadowsync_store(entry):
+                        found.append(resolved)
+                        seen.add(resolved)
+                    continue
+                if is_valid_shadowsync_store(entry):
+                    resolved = entry.resolve()
+                    if resolved not in seen:
+                        found.append(resolved)
+                        seen.add(resolved)
+                    continue
+                if depth < max_depth:
+                    _scan_dir(entry, depth + 1)
+        except (OSError, PermissionError):
+            pass
+
+    for root in prioritized:
+        if root.name == "ShadowSyncStore" or root.name.lower() == "shadowsyncstore":
+            resolved = root.resolve()
+            if resolved not in seen and is_valid_shadowsync_store(root):
+                found.append(resolved)
+                seen.add(resolved)
+            continue
+        _scan_dir(root, 0)
+
+    return found
+
+
+# ---------------------------------------------------------------------------
+# String / name helpers
+# ---------------------------------------------------------------------------
 
 def sanitize_app_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
@@ -396,6 +605,10 @@ def guess_profile_path(app_name: str) -> str:
     return str(Path.home() / ".config" / sanitize_app_name(app_name))
 
 
+# ---------------------------------------------------------------------------
+# Crypto / hashing
+# ---------------------------------------------------------------------------
+
 def calculate_file_sha256(file_path: Path) -> str:
     sha256_hash = hashlib.sha256()
     with file_path.open("rb") as handle:
@@ -438,9 +651,7 @@ def verify_executable_hash(file_path: Path, app_name: str, storage_root: Path, p
 def security_verdict_message(verdict: SecurityVerdict) -> str:
     short_hash = f"{verdict.sha256[:16]}...{verdict.sha256[-12:]}"
     if verdict.status == VERDICT_VERIFIED:
-        detail = (
-            f"This executable matches the signature ShadowSync previously locked for {verdict.matched_registry_name}."
-        )
+        detail = f"This executable matches the signature ShadowSync previously locked for {verdict.matched_registry_name}."
         action = "Do you want ShadowSync to use this executable?"
     elif verdict.status == VERDICT_MISMATCH:
         detail = (
@@ -489,12 +700,8 @@ def resolve_gocryptfs_binary() -> str:
 def depth_limited_files(root: Path, max_depth: int):
     stack = [(root, 0)]
     skipped = {
-        ".git",
-        ".qodo",
-        "__pycache__",
-        "System Volume Information",
-        "$RECYCLE.BIN",
-        "lost+found",
+        ".git", ".qodo", "__pycache__",
+        "System Volume Information", "$RECYCLE.BIN", "lost+found",
         "ShadowSyncStore",
     }
     while stack:
@@ -509,111 +716,6 @@ def depth_limited_files(root: Path, max_depth: int):
                     stack.append((entry, depth + 1))
         except OSError:
             continue
-
-
-def build_bwrap_command(executable: Path, profile_dir: Path) -> Optional[list[str]]:
-    if platform.system().lower() != "linux":
-        return None
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        return None
-    executable = executable.expanduser().resolve()
-    profile_dir = profile_dir.expanduser().resolve()
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    home = Path.home().resolve()
-    profile_dirs = sandbox_parent_dirs(profile_dir, home)
-    command = [
-        bwrap,
-        "--die-with-parent",
-        "--unshare-all",
-        "--share-net",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--ro-bind-try",
-        "/tmp/.X11-unix",
-        "/tmp/.X11-unix",
-        "--ro-bind-try",
-        "/tmp/.ICE-unix",
-        "/tmp/.ICE-unix",
-        "--tmpfs",
-        str(Path.home()),
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--ro-bind",
-        "/etc",
-        "/etc",
-        "--ro-bind",
-        "/lib",
-        "/lib",
-        "--ro-bind",
-        "/lib64",
-        "/lib64",
-        "--ro-bind",
-        "/bin",
-        "/bin",
-        "--ro-bind",
-        str(executable.parent),
-        "/app",
-        "--chdir",
-        "/app",
-    ]
-    for directory in profile_dirs:
-        command.extend(["--dir", str(directory)])
-    command.extend(["--bind", str(profile_dir), str(profile_dir)])
-    command.extend(session_socket_binds())
-    command.extend(xauthority_bind())
-    command.extend(sandbox_env_args())
-    command.append(f"/app/{executable.name}")
-    return command
-
-
-def sandbox_parent_dirs(target: Path, stop_at: Path) -> list[Path]:
-    target = target.resolve()
-    stop_at = stop_at.resolve()
-    directories = []
-    current = target.parent
-    while current != stop_at and stop_at in current.parents:
-        directories.append(current)
-        current = current.parent
-    directories.reverse()
-    return directories
-
-
-def session_socket_binds() -> list[str]:
-    args: list[str] = []
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime_dir:
-        runtime_path = Path(runtime_dir)
-        args.extend(["--dir", "/run", "--dir", "/run/user", "--dir", str(runtime_path)])
-        for name in ("bus", "pulse", "pipewire-0", "wayland-0", "wayland-1"):
-            path = runtime_path / name
-            if path.exists():
-                args.extend(["--bind", str(path), str(path)])
-    return args
-
-
-def xauthority_bind() -> list[str]:
-    xauthority = os.environ.get("XAUTHORITY")
-    if not xauthority:
-        return []
-    path = Path(xauthority).expanduser()
-    if not path.exists():
-        return []
-    return ["--ro-bind", str(path), str(path)]
-
-
-def sandbox_env_args() -> list[str]:
-    args: list[str] = []
-    for name in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "PULSE_SERVER", "PIPEWIRE_REMOTE", "XAUTHORITY"):
-        value = os.environ.get(name)
-        if value:
-            args.extend(["--setenv", name, value])
-    return args
 
 
 def derive_key(password: str, salt: bytes) -> bytes:
@@ -690,8 +792,6 @@ def secure_unlink(path: Path) -> None:
 
 
 def fingerprint_tree(root: Path) -> str:
-    import hashlib
-
     digest = hashlib.sha256()
     if not root.exists():
         return ""
@@ -707,6 +807,593 @@ def fingerprint_tree(root: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OS Settings — data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WifiProfile:
+    ssid: str
+    auth_type: str = ""          # WPA2, WPA3, open, etc.
+    blob: str = ""               # base64-encoded exported profile (XML on Windows, nmconnection on Linux)
+    password_hint: str = ""      # optional plaintext fallback for nmcli connect
+
+    def to_dict(self) -> dict:
+        return {
+            "ssid": self.ssid,
+            "auth_type": self.auth_type,
+            "blob": self.blob,
+            "password_hint": self.password_hint,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WifiProfile":
+        return cls(
+            ssid=str(d.get("ssid", "")),
+            auth_type=str(d.get("auth_type", "")),
+            blob=str(d.get("blob", "")),
+            password_hint=str(d.get("password_hint", "")),
+        )
+
+
+@dataclass
+class OSSettings:
+    """All OS-level state captured for hibernation / restore."""
+    wifi_profiles: List[WifiProfile] = field(default_factory=list)
+    wallpaper_path: str = ""
+    os_theme: str = "dark"
+    hostname: str = ""
+    env_vars: Dict[str, str] = field(default_factory=dict)
+    shell_rc: str = ""           # ~/.bashrc / .zshrc on Linux
+    shell_aliases: str = ""      # extracted alias lines
+    git_config: str = ""         # ~/.gitconfig
+    registry_exports: Dict[str, str] = field(default_factory=dict)  # {key: base64_reg}
+    installed_apps: List[str] = field(default_factory=list)  # human-readable app list
+    captured_at: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "wifi_profiles": [w.to_dict() for w in self.wifi_profiles],
+            "wallpaper_path": self.wallpaper_path,
+            "os_theme": self.os_theme,
+            "hostname": self.hostname,
+            "env_vars": self.env_vars,
+            "shell_rc": self.shell_rc,
+            "shell_aliases": self.shell_aliases,
+            "git_config": self.git_config,
+            "registry_exports": self.registry_exports,
+            "installed_apps": self.installed_apps,
+            "captured_at": self.captured_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OSSettings":
+        return cls(
+            wifi_profiles=[WifiProfile.from_dict(w) for w in d.get("wifi_profiles", [])],
+            wallpaper_path=str(d.get("wallpaper_path", "")),
+            os_theme=str(d.get("os_theme", "dark")),
+            hostname=str(d.get("hostname", "")),
+            env_vars=dict(d.get("env_vars", {})),
+            shell_rc=str(d.get("shell_rc", "")),
+            shell_aliases=str(d.get("shell_aliases", "")),
+            git_config=str(d.get("git_config", "")),
+            registry_exports=dict(d.get("registry_exports", {})),
+            installed_apps=list(d.get("installed_apps", [])),
+            captured_at=str(d.get("captured_at", "")),
+        )
+
+    def save(self, storage_root: Path, password: str) -> None:
+        vault_path = os_settings_vault_path(storage_root)
+        data = json.dumps(self.to_dict(), indent=2).encode("utf-8")
+        PortableVault(vault_path).save_bytes(data, password)
+
+    @classmethod
+    def load(cls, storage_root: Path, password: str) -> "OSSettings":
+        vault_path = os_settings_vault_path(storage_root)
+        if not vault_path.exists():
+            return cls()
+        raw = PortableVault(vault_path).load_bytes(password)
+        data = json.loads(raw.decode("utf-8"))
+        return cls.from_dict(data)
+
+
+# ---------------------------------------------------------------------------
+# OS Settings — worker (capture & restore)
+# ---------------------------------------------------------------------------
+
+class OSSettingsWorker:
+    """Platform-aware capture and restore of OS-level state."""
+
+    def __init__(self, log: queue.Queue) -> None:
+        self.log = log
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def capture(self) -> OSSettings:
+        settings = OSSettings()
+        settings.captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        settings.hostname = platform.node()
+        settings.os_theme = self._capture_theme()
+        settings.wallpaper_path = self._capture_wallpaper()
+        settings.wifi_profiles = self._capture_wifi()
+        settings.env_vars = self._capture_env_vars()
+        settings.git_config = self._capture_git_config()
+        settings.installed_apps = self._capture_installed_apps()
+        if _IS_LINUX:
+            settings.shell_rc = self._capture_shell_rc()
+            settings.shell_aliases = self._capture_shell_aliases()
+        if _IS_WINDOWS:
+            settings.registry_exports = self._capture_registry()
+        self._log(
+            f"OS state captured: {len(settings.wifi_profiles)} WiFi profiles, "
+            f"{len(settings.installed_apps)} installed apps, "
+            f"{len(settings.env_vars)} env vars, theme={settings.os_theme}"
+        )
+        return settings
+
+    def restore(self, settings: OSSettings) -> None:
+        self._restore_wifi(settings.wifi_profiles)
+        if settings.wallpaper_path:
+            self._restore_wallpaper(settings.wallpaper_path)
+        if settings.os_theme:
+            self._restore_theme(settings.os_theme)
+        if settings.env_vars:
+            self._restore_env_vars(settings.env_vars)
+        if settings.git_config:
+            self._restore_git_config(settings.git_config)
+        if _IS_LINUX and settings.shell_rc:
+            self._restore_shell_rc(settings.shell_rc)
+        if _IS_WINDOWS and settings.registry_exports:
+            self._restore_registry(settings.registry_exports)
+        self._log("OS state restore complete.")
+
+    # ------------------------------------------------------------------
+    # WiFi — capture
+    # ------------------------------------------------------------------
+
+    def _capture_wifi(self) -> List[WifiProfile]:
+        if _IS_WINDOWS:
+            return self._capture_wifi_windows()
+        if _IS_LINUX:
+            return self._capture_wifi_linux()
+        return []
+
+    def _capture_wifi_windows(self) -> List[WifiProfile]:
+        profiles: List[WifiProfile] = []
+        # List profiles
+        result = subprocess.run(
+            ["netsh", "wlan", "show", "profiles"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            self._log("WiFi capture: netsh not available or no profiles.")
+            return profiles
+
+        # Extract profile names
+        names = re.findall(r"All User Profile\s*:\s*(.+)", result.stdout)
+        if not names:
+            names = re.findall(r"User Profile\s*:\s*(.+)", result.stdout)
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="shadowsync-wifi-"))
+        try:
+            for name in names:
+                name = name.strip()
+                # Export with key=clear (requires admin; falls back to key=remove if not)
+                for key_opt in ("key=clear", "key=remove"):
+                    r = subprocess.run(
+                        ["netsh", "wlan", "export", "profile",
+                         f"name={name}", key_opt, f"folder={tmp_dir}"],
+                        capture_output=True, text=True, check=False,
+                    )
+                    if r.returncode == 0:
+                        break
+                # Find generated XML file
+                xml_files = list(tmp_dir.glob("*.xml"))
+                if not xml_files:
+                    continue
+                xml_path = xml_files[-1]
+                xml_data = xml_path.read_bytes()
+                blob = base64.b64encode(xml_data).decode("ascii")
+                xml_path.unlink(missing_ok=True)
+
+                # Try to extract auth type from XML
+                auth_match = re.search(r"<authentication>(.+?)</authentication>", xml_data.decode("utf-8", errors="ignore"))
+                auth_type = auth_match.group(1) if auth_match else ""
+
+                profiles.append(WifiProfile(ssid=name, auth_type=auth_type, blob=blob))
+                self._log(f"WiFi captured: {name} ({auth_type})")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return profiles
+
+    def _capture_wifi_linux(self) -> List[WifiProfile]:
+        profiles: List[WifiProfile] = []
+        # List connections
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            self._log("WiFi capture: nmcli not available.")
+            return profiles
+
+        wifi_names = []
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and "wireless" in parts[1].lower():
+                wifi_names.append(parts[0])
+
+        nm_dir = Path("/etc/NetworkManager/system-connections")
+        for name in wifi_names:
+            # Try to read the nmconnection file
+            conn_file = nm_dir / f"{name}.nmconnection"
+            blob = ""
+            if conn_file.exists():
+                try:
+                    raw = conn_file.read_bytes()
+                    blob = base64.b64encode(raw).decode("ascii")
+                except (OSError, PermissionError):
+                    self._log(f"WiFi capture: cannot read {conn_file} (need root?)")
+            profiles.append(WifiProfile(ssid=name, blob=blob))
+            self._log(f"WiFi captured: {name}")
+        return profiles
+
+    # ------------------------------------------------------------------
+    # WiFi — restore
+    # ------------------------------------------------------------------
+
+    def _restore_wifi(self, profiles: List[WifiProfile]) -> None:
+        if _IS_WINDOWS:
+            self._restore_wifi_windows(profiles)
+        elif _IS_LINUX:
+            self._restore_wifi_linux(profiles)
+
+    def _restore_wifi_windows(self, profiles: List[WifiProfile]) -> None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="shadowsync-wifi-restore-"))
+        try:
+            for profile in profiles:
+                if not profile.blob:
+                    # Fallback: use nmcli-style connect
+                    if profile.password_hint:
+                        subprocess.run(
+                            ["netsh", "wlan", "connect", f"name={profile.ssid}"],
+                            capture_output=True, check=False,
+                        )
+                    continue
+                xml_data = base64.b64decode(profile.blob)
+                xml_file = tmp_dir / f"{sanitize_app_name(profile.ssid)}.xml"
+                xml_file.write_bytes(xml_data)
+                r = subprocess.run(
+                    ["netsh", "wlan", "add", "profile", f"filename={xml_file}"],
+                    capture_output=True, text=True, check=False,
+                )
+                if r.returncode == 0:
+                    self._log(f"WiFi restored: {profile.ssid}")
+                else:
+                    self._log(f"WiFi restore failed for {profile.ssid}: {r.stderr.strip()}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _restore_wifi_linux(self, profiles: List[WifiProfile]) -> None:
+        nm_dir = Path("/etc/NetworkManager/system-connections")
+        reloaded = False
+        for profile in profiles:
+            if not profile.blob:
+                # Fallback: nmcli connect
+                if profile.password_hint:
+                    subprocess.run(
+                        ["nmcli", "dev", "wifi", "connect", profile.ssid,
+                         "password", profile.password_hint],
+                        capture_output=True, check=False, timeout=15,
+                    )
+                continue
+            raw = base64.b64decode(profile.blob)
+            conn_file = nm_dir / f"{profile.ssid}.nmconnection"
+            try:
+                nm_dir.mkdir(parents=True, exist_ok=True)
+                conn_file.write_bytes(raw)
+                conn_file.chmod(0o600)
+                reloaded = False  # mark need reload
+                self._log(f"WiFi profile written: {profile.ssid}")
+            except (OSError, PermissionError) as e:
+                self._log(f"WiFi restore: cannot write {conn_file}: {e}")
+
+        if reloaded is False:
+            r = subprocess.run(
+                ["nmcli", "connection", "reload"],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode == 0:
+                self._log("NetworkManager connections reloaded.")
+            else:
+                self._log(f"nmcli reload failed: {r.stderr.strip()}")
+
+    # ------------------------------------------------------------------
+    # Wallpaper
+    # ------------------------------------------------------------------
+
+    def _capture_wallpaper(self) -> str:
+        if _IS_WINDOWS:
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                    r"Control Panel\Desktop") as key:
+                    value, _ = winreg.QueryValueEx(key, "Wallpaper")
+                    return str(value)
+            except Exception:
+                return ""
+        if _IS_LINUX:
+            r = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode == 0:
+                return r.stdout.strip().strip("'\"")
+        return ""
+
+    def _restore_wallpaper(self, path: str) -> None:
+        if _IS_WINDOWS:
+            try:
+                import ctypes
+                ctypes.windll.user32.SystemParametersInfoW(20, 0, path, 3)
+                self._log(f"Wallpaper restored: {path}")
+            except Exception as e:
+                self._log(f"Wallpaper restore failed: {e}")
+        elif _IS_LINUX:
+            uri = path if path.startswith("file://") else f"file://{path}"
+            for key in ("picture-uri", "picture-uri-dark"):
+                subprocess.run(
+                    ["gsettings", "set", "org.gnome.desktop.background", key, uri],
+                    capture_output=True, check=False,
+                )
+            self._log(f"Wallpaper restored: {uri}")
+
+    # ------------------------------------------------------------------
+    # Theme
+    # ------------------------------------------------------------------
+
+    def _capture_theme(self) -> str:
+        if _IS_LINUX:
+            r = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode == 0 and "dark" in r.stdout.lower():
+                return "dark"
+            return "light"
+        if _IS_WINDOWS:
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                ) as key:
+                    val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                    return "light" if val == 1 else "dark"
+            except Exception:
+                return "dark"
+        return "dark"
+
+    def _restore_theme(self, theme: str) -> None:
+        if _IS_LINUX:
+            scheme = "prefer-dark" if theme == "dark" else "default"
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", scheme],
+                capture_output=True, check=False,
+            )
+            self._log(f"Theme restored: {scheme}")
+        elif _IS_WINDOWS:
+            try:
+                import winreg
+                val = 0 if theme == "dark" else 1
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    0, winreg.KEY_SET_VALUE,
+                ) as key:
+                    winreg.SetValueEx(key, "AppsUseLightTheme", 0, winreg.REG_DWORD, val)
+                    winreg.SetValueEx(key, "SystemUsesLightTheme", 0, winreg.REG_DWORD, val)
+                self._log(f"Windows theme restored: {theme}")
+            except Exception as e:
+                self._log(f"Theme restore failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Env vars
+    # ------------------------------------------------------------------
+
+    _ENV_CAPTURE_KEYS = [
+        "PATH", "EDITOR", "VISUAL", "PAGER", "LANG", "LC_ALL", "TZ",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "JAVA_HOME", "ANDROID_HOME", "GOPATH", "GOROOT",
+        "NVM_DIR", "PYENV_ROOT", "CARGO_HOME", "RUSTUP_HOME",
+    ]
+
+    def _capture_env_vars(self) -> Dict[str, str]:
+        return {k: os.environ[k] for k in self._ENV_CAPTURE_KEYS if k in os.environ}
+
+    def _restore_env_vars(self, env_vars: Dict[str, str]) -> None:
+        if _IS_WINDOWS:
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE
+                ) as key:
+                    for k, v in env_vars.items():
+                        if k.upper() == "PATH":
+                            continue  # skip PATH — too dangerous to overwrite blindly
+                        winreg.SetValueEx(key, k, 0, winreg.REG_EXPAND_SZ, v)
+                self._log(f"Env vars restored: {', '.join(env_vars.keys())}")
+            except Exception as e:
+                self._log(f"Env vars restore failed: {e}")
+        else:
+            self._log("Env vars note: set these manually or via shell_rc on Linux.")
+
+    # ------------------------------------------------------------------
+    # Shell RC / git config
+    # ------------------------------------------------------------------
+
+    def _capture_shell_rc(self) -> str:
+        for name in (".bashrc", ".zshrc", ".profile"):
+            path = Path.home() / name
+            if path.exists():
+                try:
+                    return path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+        return ""
+
+    def _restore_shell_rc(self, content: str) -> None:
+        for name in (".bashrc", ".zshrc"):
+            path = Path.home() / name
+            if path.exists():
+                try:
+                    path.write_text(content, encoding="utf-8")
+                    self._log(f"Shell RC restored: ~/{name}")
+                    return
+                except OSError as e:
+                    self._log(f"Shell RC restore failed: {e}")
+
+    def _capture_git_config(self) -> str:
+        path = Path.home() / ".gitconfig"
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        return ""
+
+    def _restore_git_config(self, content: str) -> None:
+        path = Path.home() / ".gitconfig"
+        try:
+            path.write_text(content, encoding="utf-8")
+            self._log("Git config restored: ~/.gitconfig")
+        except OSError as e:
+            self._log(f"Git config restore failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Registry (Windows only)
+    # ------------------------------------------------------------------
+
+    _REGISTRY_KEYS = [
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        r"HKCU\Console",
+    ]
+
+    def _capture_registry(self) -> Dict[str, str]:
+        exports: Dict[str, str] = {}
+        tmp_dir = Path(tempfile.mkdtemp(prefix="shadowsync-reg-"))
+        try:
+            for key_path in self._REGISTRY_KEYS:
+                safe = re.sub(r"[^A-Za-z0-9]+", "_", key_path)
+                out_file = tmp_dir / f"{safe}.reg"
+                r = subprocess.run(
+                    ["reg", "export", key_path, str(out_file), "/y"],
+                    capture_output=True, check=False,
+                )
+                if r.returncode == 0 and out_file.exists():
+                    raw = out_file.read_bytes()
+                    exports[key_path] = base64.b64encode(raw).decode("ascii")
+                    self._log(f"Registry captured: {key_path}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return exports
+
+    def _restore_registry(self, exports: Dict[str, str]) -> None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="shadowsync-reg-restore-"))
+        try:
+            for key_path, b64 in exports.items():
+                safe = re.sub(r"[^A-Za-z0-9]+", "_", key_path)
+                reg_file = tmp_dir / f"{safe}.reg"
+                reg_file.write_bytes(base64.b64decode(b64))
+                r = subprocess.run(
+                    ["reg", "import", str(reg_file)],
+                    capture_output=True, text=True, check=False,
+                )
+                if r.returncode == 0:
+                    self._log(f"Registry restored: {key_path}")
+                else:
+                    self._log(f"Registry restore failed for {key_path}: {r.stderr.strip()}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Installed apps
+    # ------------------------------------------------------------------
+
+    def _capture_installed_apps(self) -> List[str]:
+        apps: List[str] = []
+        if _IS_LINUX:
+            apps.extend(self._run_lines(["dpkg", "--get-selections"], prefix="dpkg"))
+            apps.extend(self._run_lines(["flatpak", "list", "--app", "--columns=name"], prefix="flatpak"))
+            apps.extend(self._run_lines(["snap", "list"], prefix="snap", skip_header=True))
+        elif _IS_WINDOWS:
+            # winget (if available)
+            r = subprocess.run(
+                ["winget", "list", "--accept-source-agreements"],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines()[2:]:  # skip header
+                    parts = line.split()
+                    if parts:
+                        apps.append(f"winget:{parts[0]}")
+            # PowerShell installed packages (fast)
+            r2 = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Package | Select-Object -ExpandProperty Name"],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            if r2.returncode == 0:
+                for line in r2.stdout.splitlines():
+                    name = line.strip()
+                    if name:
+                        apps.append(f"pkg:{name}")
+        unique = list(dict.fromkeys(apps))  # deduplicate preserving order
+        self._log(f"Installed apps captured: {len(unique)} entries.")
+        return unique
+
+    def _run_lines(self, cmd: List[str], prefix: str = "", skip_header: bool = False) -> List[str]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=20)
+            if r.returncode != 0:
+                return []
+            lines = r.stdout.splitlines()
+            if skip_header and lines:
+                lines = lines[1:]
+            tag = f"{prefix}:" if prefix else ""
+            return [f"{tag}{l.strip()}" for l in lines if l.strip()]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+    # ------------------------------------------------------------------
+    # Shell aliases
+    # ------------------------------------------------------------------
+
+    def _capture_shell_aliases(self) -> str:
+        """Extract alias lines from common shell RC files."""
+        aliases: List[str] = []
+        for name in (".bashrc", ".zshrc", ".bash_aliases"):
+            path = Path.home() / name
+            if not path.exists():
+                continue
+            try:
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("alias "):
+                        aliases.append(stripped)
+            except OSError:
+                pass
+        result = "\n".join(dict.fromkeys(aliases))  # deduplicated
+        self._log(f"Shell aliases captured: {len(aliases)} entries.")
+        return result
+
+    def _log(self, msg: str) -> None:
+        self.log.put(msg)
+
+
+# ---------------------------------------------------------------------------
 # Hydrate — data model
 # ---------------------------------------------------------------------------
 
@@ -715,20 +1402,20 @@ class HydrateConfig:
     """All personalisation settings stored in the encrypted hydrate vault."""
     dark_mode: bool = True
     wallpaper_path: str = "/live/mount/medium/wallpaper.jpg"
-    wifi_profiles: list = None  # list of {"ssid": str, "password": str}
+    wifi_profiles: list = None  # list of {ssid, password} — simple plaintext fallback
     git_remote: str = ""
     git_branch: str = "main"
     git_name: str = "Tails User"
     git_email: str = ""
-    git_token: str = ""  # PAT; injected at runtime, never written to .git/config
+    git_token: str = ""
+    # New fields
+    git_host: str = "github"   # "github" | "gitlab" | "custom"
+    auto_push_on_close: bool = False
+    push_includes_os_state: bool = True
 
     def __post_init__(self) -> None:
         if self.wifi_profiles is None:
             self.wifi_profiles = []
-
-    # ------------------------------------------------------------------
-    # Serialisation
-    # ------------------------------------------------------------------
 
     def to_dict(self) -> dict:
         return {
@@ -740,6 +1427,9 @@ class HydrateConfig:
             "git_name": self.git_name,
             "git_email": self.git_email,
             "git_token": self.git_token,
+            "git_host": self.git_host,
+            "auto_push_on_close": self.auto_push_on_close,
+            "push_includes_os_state": self.push_includes_os_state,
         }
 
     @classmethod
@@ -753,11 +1443,10 @@ class HydrateConfig:
             git_name=str(data.get("git_name", "Tails User")),
             git_email=str(data.get("git_email", "")),
             git_token=str(data.get("git_token", "")),
+            git_host=str(data.get("git_host", "github")),
+            auto_push_on_close=bool(data.get("auto_push_on_close", False)),
+            push_includes_os_state=bool(data.get("push_includes_os_state", True)),
         )
-
-    # ------------------------------------------------------------------
-    # Vault I/O
-    # ------------------------------------------------------------------
 
     def save(self, storage_root: Path, password: str) -> None:
         vault_path = hydrate_config_path(storage_root)
@@ -816,10 +1505,6 @@ class HydrateWorker:
             t.join(timeout=30)
         self._log("Hydrate: all hooks completed.")
 
-    # ------------------------------------------------------------------
-    # Individual hooks
-    # ------------------------------------------------------------------
-
     def _apply_dark_mode(self) -> None:
         try:
             subprocess.run(
@@ -835,11 +1520,9 @@ class HydrateWorker:
 
     def _apply_wallpaper(self) -> None:
         uri = self.config.wallpaper_path.strip()
-        # Ensure file:// URI format
         if not uri.startswith(("file://", "http://", "https://")):
             uri = "file://" + uri
         try:
-            # Set for both light and dark to cover X11 and Wayland
             for key in ("picture-uri", "picture-uri-dark"):
                 subprocess.run(
                     ["gsettings", "set", "org.gnome.desktop.background", key, uri],
@@ -852,35 +1535,82 @@ class HydrateWorker:
             self._log(f"Hydrate: wallpaper failed: {exc.stderr.strip()}")
 
     def _apply_wifi(self) -> None:
+        """
+        Hydrate WiFi for Tails/Linux.
+
+        Strategy:
+        1. If the OS Settings vault has been captured and saved (recommended), the
+           HydrateConfig.wifi_profiles list carries plaintext SSID+password tuples
+           as a quick-connect fallback.  The *full* profile blobs (nmconnection
+           files) are stored in OSSettings and applied by OSSettingsWorker — use
+           the OS State tab for that.
+        2. Here we write each nmconnection blob (if stored in the simple profile
+           dict as a 'blob' key) into NetworkManager, then fall back to nmcli
+           connect with the plaintext password — so Tails users never have to
+           type the password again after hydrating from the vault.
+        """
+        nm_dir = Path("/etc/NetworkManager/system-connections")
+        reloaded = False
         for idx, profile in enumerate(self.config.wifi_profiles, start=1):
             ssid = str(profile.get("ssid", "")).strip()
             pwd = str(profile.get("password", "")).strip()
+            blob = str(profile.get("blob", "")).strip()
             if not ssid:
                 continue
-            self._log(f"Hydrate: connecting Wi-Fi profile {idx} ({ssid})…")
-            try:
-                cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-                if pwd:
-                    cmd += ["password", pwd]
-                result = subprocess.run(
-                    cmd, check=False,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    timeout=20,
-                )
-                if result.returncode == 0:
-                    self._log(f"Hydrate: Wi-Fi connected to {ssid}.")
-                    return  # success — stop trying further profiles
-                self._log(f"Hydrate: Wi-Fi profile {idx} failed ({ssid}): {result.stderr.strip()}")
-            except FileNotFoundError:
-                self._log("Hydrate: nmcli not found — skipping Wi-Fi.")
-                return
-            except subprocess.TimeoutExpired:
-                self._log(f"Hydrate: Wi-Fi profile {idx} timed out.")
-        self._log("Hydrate: all Wi-Fi profiles exhausted without a successful connection.")
+            self._log(f"Hydrate: applying Wi-Fi profile {idx} ({ssid})…")
+
+            # ── Path A: write full nmconnection blob (Tails preferred) ──
+            if blob and _IS_LINUX:
+                try:
+                    nm_dir.mkdir(parents=True, exist_ok=True)
+                    conn_file = nm_dir / f"{ssid}.nmconnection"
+                    conn_file.write_bytes(base64.b64decode(blob))
+                    conn_file.chmod(0o600)
+                    reloaded = False
+                    self._log(f"Hydrate: wrote nmconnection for {ssid}.")
+                except Exception as e:
+                    self._log(f"Hydrate: blob write failed for {ssid}: {e} — falling back to connect.")
+                    blob = ""  # fall through to nmcli connect
+
+            # ── Path B: nmcli connect with stored password ──
+            if not blob:
+                try:
+                    cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+                    if pwd:
+                        cmd += ["password", pwd]
+                    result = subprocess.run(
+                        cmd, check=False,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        timeout=20,
+                    )
+                    if result.returncode == 0:
+                        self._log(f"Hydrate: Wi-Fi connected to {ssid}.")
+                        return
+                    self._log(f"Hydrate: connect failed for {ssid}: {result.stderr.strip()}")
+                except FileNotFoundError:
+                    self._log("Hydrate: nmcli not found — skipping Wi-Fi.")
+                    return
+                except subprocess.TimeoutExpired:
+                    self._log(f"Hydrate: Wi-Fi profile {idx} timed out.")
+
+        # Reload NM after writing any blobs
+        if not reloaded and _IS_LINUX:
+            r = subprocess.run(
+                ["nmcli", "connection", "reload"],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode == 0:
+                self._log("Hydrate: NetworkManager reloaded with new profiles.")
+            else:
+                self._log(f"Hydrate: nmcli reload: {r.stderr.strip()}") 
 
     def _log(self, message: str) -> None:
         self.log.put(message)
 
+
+# ---------------------------------------------------------------------------
+# Git Push worker
+# ---------------------------------------------------------------------------
 
 class GitPushWorker:
     """
@@ -897,10 +1627,12 @@ class GitPushWorker:
         storage_root: Path,
         config: HydrateConfig,
         log: queue.Queue,
+        summary: str = "",
     ) -> None:
         self.storage_root = storage_root.expanduser().resolve()
         self.config = config
         self.log = log
+        self.summary = summary
 
     def run(self) -> None:
         cfg = self.config
@@ -919,17 +1651,15 @@ class GitPushWorker:
             self._set_remote(cfg.git_remote, cfg.git_token)
             self._git("checkout", "-B", branch)
             self._git("add", "-A")
-            commit_msg = f"ShadowSync vault backup — {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+            commit_msg = (
+                f"ShadowSync auto-push — {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+                + (f" | {self.summary}" if self.summary else "")
+            )
             self._git("commit", "--allow-empty", "-m", commit_msg)
-            # Push WITHOUT --force to preserve history
             self._git_push(branch)
             self._log(f"Git Push: vault pushed successfully to branch '{branch}'.")
         except ShadowSyncError as exc:
             self._log(f"Git Push error: {exc}")
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _write_gitignore(self) -> None:
         gitignore = self.storage_root / ".gitignore"
@@ -940,10 +1670,7 @@ class GitPushWorker:
             pass
 
     def _set_remote(self, remote_url: str, token: str) -> None:
-        """Set the remote URL, embedding the PAT at runtime without persisting it."""
-        # Build authenticated URL if token provided
         if token:
-            # Insert token into https://token@host/... format
             if remote_url.startswith("https://"):
                 authed_url = "https://" + token + "@" + remote_url[len("https://"):]
             else:
@@ -951,13 +1678,11 @@ class GitPushWorker:
         else:
             authed_url = remote_url
 
-        # Check if remote exists
         result = subprocess.run(
             ["git", "-C", str(self.storage_root), "remote", "get-url", "origin"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
         )
         if result.returncode == 0:
-            # Update existing remote URL (in-memory only for this session)
             subprocess.run(
                 ["git", "-C", str(self.storage_root), "remote", "set-url", "origin", authed_url],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
@@ -979,7 +1704,6 @@ class GitPushWorker:
             )
 
     def _git_push(self, branch: str) -> None:
-        """Push to remote. No --force, so history is always preserved."""
         cmd = ["git", "-C", str(self.storage_root), "push", "origin", branch]
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
@@ -994,7 +1718,233 @@ class GitPushWorker:
 
 
 # ---------------------------------------------------------------------------
-# Original RunOptions dataclass (unchanged)
+# Git History — query commit log and restore individual vaults
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GitCommitInfo:
+    branch: str
+    commit_hash: str
+    subject: str
+    author_date: str
+    has_apps: bool = False
+    has_os: bool = False
+    app_names: List[str] = field(default_factory=list)
+
+
+class GitHistoryWorker:
+    """
+    Reads the local git history of the ShadowSync storage root.
+    Each auto-push creates a timestamped branch, so we list branches
+    sorted by date to produce a backup timeline.
+    """
+
+    def __init__(self, storage_root: Path, log: queue.Queue) -> None:
+        self.storage_root = storage_root.expanduser().resolve()
+        self.log = log
+
+    def fetch_commits(self, max_entries: int = 50) -> List[GitCommitInfo]:
+        """Return recent backup commits ordered newest-first."""
+        commits: List[GitCommitInfo] = []
+        if not (self.storage_root / ".git").exists():
+            return commits
+
+        # List remote-tracking branches that look like our backup branches
+        r = subprocess.run(
+            ["git", "-C", str(self.storage_root),
+             "branch", "-a", "--sort=-committerdate",
+             "--format=%(refname:short)|||%(objectname:short)|||%(subject)|||%(committerdate:iso)"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            self._log(f"Git history: {r.stderr.strip() or 'git branch failed'}")
+            return commits
+
+        for line in r.stdout.splitlines():
+            parts = line.split("|||", 3)
+            if len(parts) < 4:
+                continue
+            branch, commit_hash, subject, date = parts
+            branch = branch.strip()
+            # Only show backup branches and main/master
+            if not ("backup-" in branch or branch in ("main", "master", "origin/main", "origin/master")):
+                continue
+            # Inspect tree at that commit for apps and os_settings
+            tree_r = subprocess.run(
+                ["git", "-C", str(self.storage_root),
+                 "ls-tree", "--name-only", commit_hash],
+                capture_output=True, text=True, check=False,
+            )
+            top_level = set(tree_r.stdout.splitlines())
+            has_os = "os_settings" in top_level
+            # List apps
+            app_names: List[str] = []
+            if "apps" in top_level:
+                apps_r = subprocess.run(
+                    ["git", "-C", str(self.storage_root),
+                     "ls-tree", "--name-only", f"{commit_hash}:apps"],
+                    capture_output=True, text=True, check=False,
+                )
+                app_names = [n.strip() for n in apps_r.stdout.splitlines() if n.strip()]
+
+            commits.append(GitCommitInfo(
+                branch=branch,
+                commit_hash=commit_hash.strip(),
+                subject=subject.strip(),
+                author_date=date.strip(),
+                has_apps=bool(app_names),
+                has_os=has_os,
+                app_names=app_names,
+            ))
+            if len(commits) >= max_entries:
+                break
+
+        return commits
+
+    def _log(self, msg: str) -> None:
+        self.log.put(msg)
+
+
+class GitRestoreWorker:
+    """
+    Restores a specific app vault or the OS state vault from a historical
+    Git commit.  The ssvault file is checked out from the commit into a
+    temp location, then the caller decrypts it normally.
+    """
+
+    def __init__(self, storage_root: Path, log: queue.Queue) -> None:
+        self.storage_root = storage_root.expanduser().resolve()
+        self.log = log
+
+    def restore_app_vault(
+        self,
+        commit_hash: str,
+        app_name: str,
+        profile_name: str,
+        destination: Path,
+        password: str,
+    ) -> bool:
+        """Checkout profile.ssvault from commit and decrypt it to destination."""
+        git_path = f"apps/{sanitize_app_name(app_name)}/profiles/{sanitize_app_name(profile_name)}/profile.ssvault"
+        return self._restore_ssvault(commit_hash, git_path, destination, password)
+
+    def restore_os_vault(
+        self,
+        commit_hash: str,
+        storage_root: Path,
+        password: str,
+    ) -> Optional[OSSettings]:
+        """Checkout os_state.ssvault from commit, decrypt and return OSSettings."""
+        git_path = "os_settings/os_state.ssvault"
+        tmp_dir = Path(tempfile.mkdtemp(prefix="shadowsync-os-restore-"))
+        tmp_vault = tmp_dir / "os_state.ssvault"
+        try:
+            if not self._checkout_file(commit_hash, git_path, tmp_vault):
+                return None
+            raw = PortableVault(tmp_vault).load_bytes(password)
+            data = json.loads(raw.decode("utf-8"))
+            self._log(f"OS settings restored from commit {commit_hash[:8]}.")
+            return OSSettings.from_dict(data)
+        except Exception as exc:
+            self._log(f"OS restore error: {exc}")
+            return None
+        finally:
+            wipe_directory(tmp_dir)
+
+    def _restore_ssvault(self, commit_hash: str, git_path: str, destination: Path, password: str) -> bool:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="shadowsync-git-restore-"))
+        tmp_vault = tmp_dir / "profile.ssvault"
+        try:
+            if not self._checkout_file(commit_hash, git_path, tmp_vault):
+                return False
+            PortableVault(tmp_vault).restore_to(destination, password)
+            self._log(f"Vault from commit {commit_hash[:8]} restored to: {destination}")
+            return True
+        except ShadowSyncError as exc:
+            self._log(f"Restore failed: {exc}")
+            return False
+        finally:
+            wipe_directory(tmp_dir)
+
+    def _checkout_file(self, commit_hash: str, git_path: str, out_file: Path) -> bool:
+        """Run git show to extract a single file from a commit."""
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            ["git", "-C", str(self.storage_root),
+             "show", f"{commit_hash}:{git_path}"],
+            capture_output=True, check=False,
+        )
+        if r.returncode != 0:
+            self._log(f"git show {commit_hash[:8]}:{git_path} failed: {r.stderr.decode(errors='replace').strip()}")
+            return False
+        out_file.write_bytes(r.stdout)
+        return True
+
+    def _log(self, msg: str) -> None:
+        self.log.put(msg)
+
+
+# ---------------------------------------------------------------------------
+# Shutdown hook — auto-push on close / shutdown
+# ---------------------------------------------------------------------------
+
+class ShutdownHook:
+    """
+    Registers atexit + platform signals so that when the process exits
+    (app close, Ctrl+C, SIGTERM, Windows logoff), a Git push is attempted.
+    """
+
+    def __init__(self) -> None:
+        self._callback = None
+        self._registered = False
+
+    def register(self, callback) -> None:
+        """Set the callback that will be called on shutdown. Call once."""
+        self._callback = callback
+        if self._registered:
+            return
+        self._registered = True
+        atexit.register(self._fire)
+        # POSIX signals
+        for sig in (signal.SIGTERM,):
+            try:
+                signal.signal(sig, self._signal_handler)
+            except (OSError, ValueError):
+                pass
+        # Windows console handler
+        if _HAS_WIN32:
+            try:
+                win32api.SetConsoleCtrlHandler(self._win32_handler, True)
+            except Exception:
+                pass
+
+    def unregister(self) -> None:
+        """Clear the callback (e.g., user turned off auto-push)."""
+        self._callback = None
+
+    def _fire(self) -> None:
+        if self._callback:
+            try:
+                self._callback()
+            except Exception:
+                pass
+
+    def _signal_handler(self, signum, frame) -> None:
+        self._fire()
+        sys.exit(0)
+
+    def _win32_handler(self, event_type) -> bool:
+        # CTRL_CLOSE_EVENT=2, CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6
+        if event_type in (2, 5, 6):
+            self._fire()
+        return False
+
+
+_SHUTDOWN_HOOK = ShutdownHook()
+
+
+# ---------------------------------------------------------------------------
+# RunOptions / ShadowSyncWorker
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -1008,6 +1958,88 @@ class RunOptions:
     mode: str
     wipe_after: bool
     sandbox_app: bool
+
+
+def build_bwrap_command(executable: Path, profile_dir: Path) -> Optional[list[str]]:
+    if platform.system().lower() != "linux":
+        return None
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return None
+    executable = executable.expanduser().resolve()
+    profile_dir = profile_dir.expanduser().resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    home = Path.home().resolve()
+    profile_dirs = sandbox_parent_dirs(profile_dir, home)
+    command = [
+        bwrap,
+        "--die-with-parent", "--unshare-all", "--share-net",
+        "--proc", "/proc", "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix",
+        "--ro-bind-try", "/tmp/.ICE-unix", "/tmp/.ICE-unix",
+        "--tmpfs", str(Path.home()),
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/etc", "/etc",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", str(executable.parent), "/app",
+        "--chdir", "/app",
+    ]
+    for directory in profile_dirs:
+        command.extend(["--dir", str(directory)])
+    command.extend(["--bind", str(profile_dir), str(profile_dir)])
+    command.extend(session_socket_binds())
+    command.extend(xauthority_bind())
+    command.extend(sandbox_env_args())
+    command.append(f"/app/{executable.name}")
+    return command
+
+
+def sandbox_parent_dirs(target: Path, stop_at: Path) -> list[Path]:
+    target = target.resolve()
+    stop_at = stop_at.resolve()
+    directories = []
+    current = target.parent
+    while current != stop_at and stop_at in current.parents:
+        directories.append(current)
+        current = current.parent
+    directories.reverse()
+    return directories
+
+
+def session_socket_binds() -> list[str]:
+    args: list[str] = []
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        runtime_path = Path(runtime_dir)
+        args.extend(["--dir", "/run", "--dir", "/run/user", "--dir", str(runtime_path)])
+        for name in ("bus", "pulse", "pipewire-0", "wayland-0", "wayland-1"):
+            path = runtime_path / name
+            if path.exists():
+                args.extend(["--bind", str(path), str(path)])
+    return args
+
+
+def xauthority_bind() -> list[str]:
+    xauthority = os.environ.get("XAUTHORITY")
+    if not xauthority:
+        return []
+    path = Path(xauthority).expanduser()
+    if not path.exists():
+        return []
+    return ["--ro-bind", str(path), str(path)]
+
+
+def sandbox_env_args() -> list[str]:
+    args: list[str] = []
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                 "PULSE_SERVER", "PIPEWIRE_REMOTE", "XAUTHORITY"):
+        value = os.environ.get(name)
+        if value:
+            args.extend(["--setenv", name, value])
+    return args
 
 
 class ShadowSyncWorker:
@@ -1168,7 +2200,6 @@ class ShadowSyncWorker:
         fuse_conf = paths["fuse_cipher_dir"] / "gocryptfs.conf"
         if fuse_conf.exists() or not portable_vault.exists():
             return
-
         self._log("Portable vault found. Migrating app data into FUSE storage...")
         restored = Path(tempfile.mkdtemp(prefix="shadowsync-restore-"))
         mountpoint = Path(tempfile.mkdtemp(prefix="shadowsync-mount-"))
@@ -1200,7 +2231,6 @@ class ShadowSyncWorker:
         if platform.system().lower() == "windows":
             self._log("FUSE storage exists, but Windows cannot read gocryptfs. Using portable vault if present.")
             return
-
         self._log("FUSE storage found. Migrating app data into the portable vault...")
         staging = Path(tempfile.mkdtemp(prefix="shadowsync-migrate-"))
         bridge = GocryptfsBridge(paths["fuse_cipher_dir"], staging, self.options.password)
@@ -1209,7 +2239,6 @@ class ShadowSyncWorker:
                 bridge.mount()
             except ShadowSyncError as exc:
                 self._log(f"FUSE-to-DIY migration skipped: {exc}")
-                self._log("Continuing with a clean DIY profile or existing portable vault.")
                 return
             self._busy(True, "Encrypting portable vault from FUSE storage...")
             try:
@@ -1219,7 +2248,6 @@ class ShadowSyncWorker:
                     self._busy(False)
             except ShadowSyncError as exc:
                 self._log(f"FUSE-to-DIY migration failed: {exc}")
-                self._log("Continuing without migration so the app is still usable.")
                 return
             self._log("Migration complete. FUSE storage kept as a backup.")
         finally:
@@ -1248,13 +2276,48 @@ class ShadowSyncWorker:
         self.log.put(("busy", active, message))
 
 
-class ShadowSyncApp(tk.Tk):
+# ---------------------------------------------------------------------------
+# Main GUI
+# ---------------------------------------------------------------------------
+
+class ShadowSyncApp(ctk.CTk):
+    # ── Palette ──────────────────────────────────────────────────────────────
+    C = {
+        "bg":        "#0f111a",
+        "sidebar":   "#141824",
+        "panel":     "#0f111a",
+        "card":      "#1a2035",
+        "accent":    "#00c8ff",
+        "accent2":   "#0097c4",
+        "purple":    "#7c3aed",
+        "purple2":   "#6d28d9",
+        "green":     "#22c55e",
+        "green2":    "#16a34a",
+        "danger":    "#e03131",
+        "danger2":   "#c92a2a",
+        "ghost":     "#212942",
+        "ghost2":    "#2a3454",
+        "text":      "#e2eaf4",
+        "muted":     "#7a8ea3",
+        "label":     "#8aabcc",
+        "run_green": "#22c55e",
+        "lock_blue": "#3b82f6",
+        "input_bg":  "#141824",
+        "log_bg":    "#060c18",
+        "log_ts":    "#3a5270",
+        "log_ok":    "#22c55e",
+        "log_err":   "#f87171",
+        "log_warn":  "#fbbf24",
+        "log_info":  "#93c5fd",
+    }
+
     def __init__(self) -> None:
         super().__init__()
-        self.title("ShadowSync")
-        self.geometry("980x860")
-        self.minsize(860, 780)
-        self.configure(bg="#101820")
+        self.title("ShadowSync v2.0")
+        self.geometry("1200x880")
+        self.minsize(960, 760)
+        self.configure(fg_color=self.C["bg"])
+
         self.presets = default_profile_paths()
         self.log_queue: queue.Queue[object] = queue.Queue()
         self.worker: Optional[ShadowSyncWorker] = None
@@ -1262,350 +2325,789 @@ class ShadowSyncApp(tk.Tk):
         self.approved_executable_path = ""
         self.approved_storage_root = ""
         self.sandbox_next_launch = False
-        # Hydrate state
         self._hydrate_config: Optional[HydrateConfig] = None
-        self._hydrate_expanded = tk.BooleanVar(value=False)
-        self._build_styles()
-        self._build_ui()
+        self._os_settings: Optional[OSSettings] = None
+        self._pw_visible = False
+        self._files_view_mode = "list"
+        self._files_manifest: list[dict] = []
+        self._files_view_frame: Optional[ctk.CTkFrame] = None
+        self._files_status_label: Optional[ctk.CTkLabel] = None
+        self._files_empty_label: Optional[ctk.CTkLabel] = None
+        self._stored_apps_frame: Optional[ctk.CTkFrame] = None
+        self._os_tab_summary_frame: Optional[ctk.CTkFrame] = None
+        self._os_captured_label: Optional[ctk.CTkLabel] = None
+        # WiFi profile rows for OS tab (dynamic)
+        self._os_wifi_rows: List[dict] = []
+        self._os_wifi_container: Optional[ctk.CTkScrollableFrame] = None
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self._build_sidebar()
+        self._build_main_panel()
+
         self.after(150, self._drain_log)
+        self.after(500, self._start_storage_scan)
         self.after(900, self._start_appimage_scan)
         self.bind_all("<Control-Shift-P>", lambda _event: self._panic())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _build_styles(self) -> None:
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TFrame", background="#101820")
-        style.configure("Panel.TFrame", background="#f7f8fb")
-        style.configure("Card.TFrame", background="#ffffff", relief="flat")
-        style.configure("HydrateCard.TFrame", background="#0f0a1e", relief="flat")
-        style.configure("TLabel", background="#f7f8fb", foreground="#17212b", font=("Segoe UI", 10))
-        style.configure("Title.TLabel", font=("Segoe UI", 24, "bold"), foreground="#ffffff", background="#101820")
-        style.configure("Sub.TLabel", font=("Segoe UI", 11), foreground="#b7c3d0", background="#101820")
-        style.configure("Field.TLabel", font=("Segoe UI", 10, "bold"), foreground="#27313c", background="#ffffff")
-        style.configure("HydrateField.TLabel", font=("Segoe UI", 10, "bold"), foreground="#c4b5fd", background="#0f0a1e")
-        style.configure("HydrateSect.TLabel", font=("Segoe UI", 9, "bold"), foreground="#7c3aed", background="#0f0a1e")
-        style.configure("HydrateDisabled.TLabel", font=("Segoe UI", 10), foreground="#6b7a90", background="#0f0a1e")
-        style.configure("Status.TLabel", font=("Segoe UI", 10), foreground="#425466", background="#ffffff")
-        style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d7dce4", padding=8)
-        style.configure("HydrateEntry.TEntry", fieldbackground="#1e1535", foreground="#e9d5ff", bordercolor="#6d28d9", padding=8)
-        style.configure("TCheckbutton", background="#ffffff", foreground="#27313c", font=("Segoe UI", 10))
-        style.configure("HydrateCheck.TCheckbutton", background="#0f0a1e", foreground="#c4b5fd", font=("Segoe UI", 10))
-        style.configure("TRadiobutton", background="#ffffff", foreground="#27313c", font=("Segoe UI", 10))
-        style.configure("Primary.TButton", font=("Segoe UI", 11, "bold"), padding=(16, 10), background="#0f766e", foreground="#ffffff")
-        style.map("Primary.TButton", background=[("active", "#0d9488"), ("disabled", "#93a4b1")])
-        style.configure("Danger.TButton", font=("Segoe UI", 11, "bold"), padding=(16, 10), background="#b42318", foreground="#ffffff")
-        style.map("Danger.TButton", background=[("active", "#d92d20")])
-        style.configure("Ghost.TButton", font=("Segoe UI", 10), padding=(12, 8), background="#e8eef5", foreground="#17212b")
-        style.map("Ghost.TButton", background=[("active", "#dbe6ef")])
-        # Hydrate-specific button styles
-        style.configure("Hydrate.TButton", font=("Segoe UI", 11, "bold"), padding=(16, 10), background="#7c3aed", foreground="#ffffff")
-        style.map("Hydrate.TButton", background=[("active", "#6d28d9"), ("disabled", "#3b2d5a")])
-        style.configure("HydrateGhost.TButton", font=("Segoe UI", 10), padding=(12, 8), background="#1e1535", foreground="#c4b5fd")
-        style.map("HydrateGhost.TButton", background=[("active", "#2d1f4a")])
-        style.configure("Crypto.Horizontal.TProgressbar", troughcolor="#dce6ef", background="#0f766e", bordercolor="#dce6ef")
+    # ─────────────────────────────────────────────────────────────────────────
+    # Sidebar
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _build_ui(self) -> None:
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        sidebar = ttk.Frame(self, style="TFrame", padding=(30, 34))
+    def _build_sidebar(self) -> None:
+        C = self.C
+        sidebar = ctk.CTkFrame(self, fg_color=C["sidebar"], width=280, corner_radius=0)
         sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.columnconfigure(0, minsize=260)
-        ttk.Label(sidebar, text="ShadowSync", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            sidebar,
-            text="Encrypted persistence for amnesic sessions.",
-            style="Sub.TLabel",
-            wraplength=250,
-        ).grid(row=1, column=0, sticky="w", pady=(8, 28))
-        self.state_label = tk.Label(
-            sidebar,
-            text="Locked",
-            bg="#14313a",
-            fg="#8ee7d3",
-            font=("Segoe UI", 12, "bold"),
-            padx=16,
-            pady=12,
-            anchor="w",
+        sidebar.grid_columnconfigure(0, weight=1)
+
+        logo_f = ctk.CTkFrame(sidebar, fg_color="transparent")
+        logo_f.grid(row=0, column=0, pady=(32, 20), padx=20, sticky="ew")
+        ctk.CTkLabel(logo_f, text="🔐", font=("Segoe UI", 28), text_color=C["accent"]).pack(side="left", padx=(0, 10))
+        text_f = ctk.CTkFrame(logo_f, fg_color="transparent")
+        text_f.pack(side="left", fill="x")
+        ctk.CTkLabel(text_f, text="ShadowSync", font=("Segoe UI", 18, "bold"), text_color=C["accent"], anchor="w").pack(fill="x")
+        ctk.CTkLabel(text_f, text="Zero-Trust Persistence v2", font=("Segoe UI", 10), text_color=C["muted"], anchor="w").pack(fill="x")
+
+        ctk.CTkFrame(sidebar, fg_color=C["ghost"], height=2).grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+
+        self.status_frame = ctk.CTkFrame(sidebar, fg_color=C["ghost"], corner_radius=8)
+        self.status_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=10)
+        self._status_dot = ctk.CTkLabel(self.status_frame, text="●", font=("Segoe UI", 16), text_color=C["lock_blue"])
+        self._status_dot.pack(side="left", padx=(15, 10), pady=12)
+        self.state_label = ctk.CTkLabel(self.status_frame, text="Locked", font=("Segoe UI", 13, "bold"), text_color=C["lock_blue"])
+        self.state_label.pack(side="left", pady=12)
+
+        self.heartbeat_dot = ctk.CTkLabel(sidebar, text="● Heartbeat idle", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
+        self.heartbeat_dot.grid(row=4, column=0, sticky="ew", padx=28, pady=(0, 10))
+
+        # Drive info
+        self._drive_label = ctk.CTkLabel(sidebar, text="💾 Drive: —", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
+        self._drive_label.grid(row=5, column=0, sticky="ew", padx=28, pady=(0, 10))
+
+        panic_btn = ctk.CTkButton(sidebar, text="⚠️ PANIC WIPE", fg_color=C["danger"], hover_color=C["danger2"],
+                                  font=("Segoe UI", 12, "bold"), corner_radius=6, command=self._panic)
+        panic_btn.grid(row=6, column=0, sticky="ew", padx=20, pady=(10, 0))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Main panel / tabs
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_main_panel(self) -> None:
+        C = self.C
+        self.tabview = ctk.CTkTabview(
+            self, fg_color=C["panel"],
+            segmented_button_fg_color=C["sidebar"],
+            segmented_button_selected_color=C["accent"],
+            segmented_button_selected_hover_color=C["accent2"],
+            text_color=C["text"], corner_radius=10,
         )
-        self.state_label.grid(row=2, column=0, sticky="ew")
-        self.heartbeat_dot = tk.Label(
-            sidebar,
-            text="● Heartbeat idle",
-            bg="#101820",
-            fg="#6b7a86",
-            font=("Segoe UI", 10, "bold"),
-            anchor="w",
-            pady=8,
-        )
-        self.heartbeat_dot.grid(row=3, column=0, sticky="ew")
-        tk.Label(
-            sidebar,
-            text="1. Choose a storage mode\n2. Enter the master password\n3. Select the app and profile\n4. Launch, sync, and close",
-            bg="#101820",
-            fg="#d6e0ea",
-            justify="left",
-            font=("Segoe UI", 10),
-            pady=28,
-        ).grid(row=4, column=0, sticky="w")
+        self.tabview.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
 
-        main = ttk.Frame(self, style="Panel.TFrame", padding=(28, 28))
-        main.grid(row=0, column=1, sticky="nsew")
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(3, weight=1)
+        self.tabview.add("🔒 Vault")
+        self.tabview.add("📁 Files")
+        self.tabview.add("🖥 OS State")
+        self.tabview.add("⚡ Hydrate")
+        self.tabview.add("📜 History")
 
-        form = ttk.Frame(main, style="Card.TFrame", padding=(24, 22))
-        form.grid(row=0, column=0, sticky="ew")
-        form.columnconfigure(1, weight=1)
+        self._build_vault_tab(self.tabview.tab("🔒 Vault"))
+        self._build_files_tab(self.tabview.tab("📁 Files"))
+        self._build_os_tab(self.tabview.tab("🖥 OS State"))
+        self._build_hydrate_tab(self.tabview.tab("⚡ Hydrate"))
+        self._build_history_tab(self.tabview.tab("📜 History"))
 
-        self.mode_var = tk.StringVar(value=MODE_DIY)
-        self.storage_var = tk.StringVar(value=str(Path.cwd() / "ShadowSyncStore"))
-        self.app_name_var = tk.StringVar(value="Session")
-        self.profile_name_var = tk.StringVar(value="Default")
-        self.password_var = tk.StringVar()
+    # ─────────────────────────────────────────────────────────────────────────
+    # Vault Tab
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_vault_tab(self, parent) -> None:
+        C = self.C
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        card = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+        card.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(card, text="MODE", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=0, column=0, sticky="w", padx=(20, 10), pady=(20, 10))
+        self.mode_var = ctk.StringVar(value=MODE_DIY)
+        mode_f = ctk.CTkFrame(card, fg_color="transparent")
+        mode_f.grid(row=0, column=1, sticky="w", pady=(20, 10))
+        ctk.CTkRadioButton(mode_f, text="DIY sync-on-close", variable=self.mode_var, value=MODE_DIY, command=self._mode_changed, text_color=C["text"]).pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(mode_f, text="On-the-fly FUSE", variable=self.mode_var, value=MODE_FUSE, command=self._mode_changed, text_color=C["text"]).pack(side="left")
+
+        self.storage_var = ctk.StringVar(value=str(Path.cwd() / "ShadowSyncStore"))
+        self.app_name_var = ctk.StringVar(value="Session")
+        self.profile_name_var = ctk.StringVar(value="Default")
+        self.profile_kind_var = ctk.StringVar(value="Session")
+        self.profile_var = ctk.StringVar(value=self.presets.get("Session", ""))
+        self.exec_var = ctk.StringVar()
+        self.wipe_var = ctk.BooleanVar(value=True)
+        self.password_var = ctk.StringVar()
         self.password_var.trace_add("write", lambda *_args: self._clear_executable_approval())
-        self.profile_kind_var = tk.StringVar(value="Session")
-        self.profile_var = tk.StringVar(value=self.presets["Session"])
-        self.exec_var = tk.StringVar()
-        self.wipe_var = tk.BooleanVar(value=True)
 
-        self._mode_field(form, 0)
-        self._field(form, 1, "Storage folder", self.storage_var, self._browse_storage)
-        self._field(form, 2, "App name", self.app_name_var, None)
-        self._profile_name_field(form, 3)
-        self._password_field(form, 4)
-        self._preset_field(form, 5)
-        self._field(form, 6, "Profile folder", self.profile_var, self._browse_profile)
-        self._field(form, 7, "Application", self.exec_var, self._browse_executable)
+        self._vault_field(card, 1, "STORAGE FOLDER", self.storage_var, self._browse_storage)
+        self._vault_field(card, 2, "APP NAME", self.app_name_var, None)
+        self._vault_field(card, 3, "PROFILE FOLDER", self.profile_var, self._browse_profile, is_profile=True)
+        self._vault_field(card, 4, "APPLICATION", self.exec_var, self._browse_executable)
 
-        options = ttk.Frame(form, style="Card.TFrame")
-        options.grid(row=8, column=1, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(options, text="Wipe profile after close", variable=self.wipe_var).grid(row=0, column=0)
+        ctk.CTkLabel(card, text="PROFILE NAME", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=5, column=0, sticky="w", padx=(20, 10), pady=10)
+        pname_f = ctk.CTkFrame(card, fg_color="transparent")
+        pname_f.grid(row=5, column=1, sticky="ew", pady=10, padx=(0, 20))
+        pname_f.grid_columnconfigure(0, weight=1)
+        self.profile_combo = ctk.CTkComboBox(pname_f, variable=self.profile_name_var, values=["Default"], fg_color=C["input_bg"], border_color=C["ghost"], button_color=C["ghost"])
+        self.profile_combo.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(pname_f, text="Refresh", width=80, fg_color=C["ghost"], hover_color=C["ghost2"], command=self._refresh_profile_names).grid(row=0, column=1, padx=(10, 0))
 
-        actions = ttk.Frame(form, style="Card.TFrame")
-        actions.grid(row=9, column=1, sticky="ew", pady=(22, 0))
-        ttk.Button(actions, text="Open & Launch", style="Primary.TButton", command=self._start).grid(row=0, column=0, sticky="w")
-        ttk.Button(actions, text="Save Vault Now", style="Ghost.TButton", command=self._save_now).grid(row=0, column=1, padx=10)
-        ttk.Button(actions, text="Stop", style="Ghost.TButton", command=self._stop_worker).grid(row=0, column=2)
-        ttk.Button(actions, text="Panic", style="Danger.TButton", command=self._panic).grid(row=0, column=3, padx=(10, 0))
+        ctk.CTkLabel(card, text="PRESET", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=6, column=0, sticky="w", padx=(20, 10), pady=10)
+        preset = ctk.CTkComboBox(card, variable=self.profile_kind_var, values=list(self.presets), fg_color=C["input_bg"], border_color=C["ghost"], button_color=C["ghost"], command=self._preset_changed)
+        preset.grid(row=6, column=1, sticky="ew", pady=10, padx=(0, 20))
 
-        file_actions = ttk.Frame(form, style="Card.TFrame")
-        file_actions.grid(row=10, column=1, sticky="ew", pady=(12, 0))
-        ttk.Button(file_actions, text="Add Files", style="Ghost.TButton", command=self._add_files_to_vault).grid(row=0, column=0)
-        ttk.Button(file_actions, text="Add Folder", style="Ghost.TButton", command=self._add_folder_to_vault).grid(row=0, column=1, padx=10)
-        ttk.Button(file_actions, text="Export Files", style="Ghost.TButton", command=self._export_files_vault).grid(row=0, column=2)
+        ctk.CTkLabel(card, text="MASTER PASSWORD", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=7, column=0, sticky="w", padx=(20, 10), pady=10)
+        pw_f = ctk.CTkFrame(card, fg_color="transparent")
+        pw_f.grid(row=7, column=1, sticky="ew", pady=10, padx=(0, 20))
+        pw_f.grid_columnconfigure(0, weight=1)
+        self._pw_entry = ctk.CTkEntry(pw_f, textvariable=self.password_var, show="●", fg_color=C["input_bg"], border_color=C["ghost"])
+        self._pw_entry.grid(row=0, column=0, sticky="ew")
+        self._pw_eye_btn = ctk.CTkButton(pw_f, text="👁", width=40, fg_color=C["ghost"], hover_color=C["ghost2"], command=self._toggle_password_visibility)
+        self._pw_eye_btn.grid(row=0, column=1, padx=(10, 0))
 
-        self.progress = ttk.Progressbar(form, style="Crypto.Horizontal.TProgressbar", mode="indeterminate")
-        self.progress.grid(row=11, column=1, sticky="ew", pady=(16, 0))
+        ctk.CTkCheckBox(card, text="Wipe profile after close", variable=self.wipe_var, text_color=C["text"], fg_color=C["accent"]).grid(row=8, column=1, sticky="w", pady=(10, 20))
+
+        actions_f = ctk.CTkFrame(card, fg_color="transparent")
+        actions_f.grid(row=9, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 20))
+        ctk.CTkButton(actions_f, text="▶ Open & Launch", font=("Segoe UI", 13, "bold"), fg_color=C["accent"], text_color="#000", hover_color=C["accent2"], command=self._start).pack(side="left")
+        ctk.CTkButton(actions_f, text="💾 Save Vault", fg_color=C["ghost"], hover_color=C["ghost2"], command=self._save_now).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(actions_f, text="⬛ Stop", fg_color=C["ghost"], hover_color=C["ghost2"], command=self._stop_worker).pack(side="left", padx=(10, 0))
+
+        self.progress = ctk.CTkProgressBar(card, mode="indeterminate", progress_color=C["accent"], fg_color=C["input_bg"])
+        self.progress.grid(row=10, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 20))
+        self.progress.set(0)
         self.progress.grid_remove()
 
-        # ------------------------------------------------------------------
-        # Hydrate card (collapsible, below the main form)
-        # ------------------------------------------------------------------
-        self._build_hydrate_card(main)
+        # Stored Apps Panel
+        apps_card = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+        apps_card.grid(row=1, column=0, sticky="ew", padx=10, pady=(10, 0))
+        apps_card.grid_columnconfigure(0, weight=1)
+        apps_header = ctk.CTkFrame(apps_card, fg_color="transparent")
+        apps_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 5))
+        apps_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(apps_header, text="📦 Stored App Vaults", font=("Segoe UI", 14, "bold"), text_color=C["accent"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(apps_header, text="🔄 Refresh", width=90, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._refresh_stored_apps).grid(row=0, column=1, sticky="e")
+        self._stored_apps_frame = ctk.CTkFrame(apps_card, fg_color="transparent")
+        self._stored_apps_frame.grid(row=1, column=0, sticky="ew", padx=15, pady=(5, 15))
+        self._stored_apps_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self._stored_apps_frame, text="No stored app vaults found. Launch an app with ShadowSync to create one.", text_color=C["muted"], font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", padx=5, pady=5)
 
-        log_card = ttk.Frame(main, style="Card.TFrame", padding=(20, 18))
-        log_card.grid(row=2, column=0, sticky="nsew", pady=(18, 0))
-        log_card.columnconfigure(0, weight=1)
-        log_card.rowconfigure(1, weight=1)
-        ttk.Label(log_card, text="Activity", style="Field.TLabel").grid(row=0, column=0, sticky="w")
-        self.log_text = tk.Text(
-            log_card,
-            height=10,
-            bg="#0f1720",
-            fg="#d9e7ef",
-            insertbackground="#ffffff",
-            relief="flat",
-            padx=14,
-            pady=12,
-            font=("Consolas", 10),
-            wrap="word",
+        # Log Terminal
+        log_card = ctk.CTkFrame(parent, fg_color=C["log_bg"], corner_radius=8)
+        log_card.grid(row=2, column=0, sticky="nsew", padx=10, pady=(10, 10))
+        log_card.grid_columnconfigure(0, weight=1)
+        log_card.grid_rowconfigure(0, weight=1)
+        self.log_text = ctk.CTkTextbox(log_card, fg_color="transparent", text_color=C["text"], font=("Consolas", 12), wrap="word")
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.log_text.tag_config("ts", foreground=C["log_ts"])
+        self.log_text.tag_config("ok", foreground=C["log_ok"])
+        self.log_text.tag_config("err", foreground=C["log_err"])
+        self.log_text.tag_config("warn", foreground=C["log_warn"])
+        self.log_text.tag_config("info", foreground=C["log_info"])
+        self.log_text.tag_config("body", foreground=C["text"])
+        self._log("Ready — enter the master password, then choose an app.")
+
+    def _vault_field(self, parent, row, label, var, browse_cmd, is_profile=False) -> None:
+        C = self.C
+        ctk.CTkLabel(parent, text=label, font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=row, column=0, sticky="w", padx=(20, 10), pady=10)
+        entry = ctk.CTkEntry(parent, textvariable=var, fg_color=C["input_bg"], border_color=C["ghost"])
+        entry.grid(row=row, column=1, sticky="ew", pady=10, padx=(0, 20 if not browse_cmd else 0))
+        if is_profile:
+            self.profile_entry = entry
+        if browse_cmd:
+            ctk.CTkButton(parent, text="Browse", width=80, fg_color=C["ghost"], hover_color=C["ghost2"], command=browse_cmd).grid(row=row, column=2, padx=(10, 20))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Files Tab — with drive picker
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_files_tab(self, parent) -> None:
+        C = self.C
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        # Header card
+        header_card = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+        header_card.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        header_card.grid_columnconfigure(0, weight=1)
+
+        title_row = ctk.CTkFrame(header_card, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 5))
+        title_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(title_row, text="📁 Files Vault — Drive Manager", font=("Segoe UI", 18, "bold"), text_color=C["text"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(header_card, text="Encrypt and carry files on any drive. Pick a target drive — the vault lives there independently.",
+                     text_color=C["muted"], font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 5))
+
+        # Drive picker row
+        drive_row = ctk.CTkFrame(header_card, fg_color="transparent")
+        drive_row.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
+        ctk.CTkLabel(drive_row, text="TARGET DRIVE", font=("Segoe UI", 11, "bold"), text_color=C["label"]).pack(side="left", padx=(0, 10))
+        self._files_drive_var = ctk.StringVar()
+        drives = list_mounted_drives()
+        default_drive = drives[0] if drives else str(Path.cwd().anchor)
+        self._files_drive_var.set(default_drive)
+        self._files_drive_combo = ctk.CTkComboBox(
+            drive_row, variable=self._files_drive_var,
+            values=drives, width=200,
+            fg_color=C["input_bg"], border_color=C["ghost"], button_color=C["ghost"],
+            command=self._on_files_drive_changed,
         )
-        self.log_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        self._log("Ready. Choose a storage mode, then enter the master password.")
+        self._files_drive_combo.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(drive_row, text="🔄 Scan Drives", width=110, fg_color=C["ghost"], hover_color=C["ghost2"],
+                      command=self._refresh_drive_list).pack(side="left", padx=(0, 8))
+        self._files_drive_path_label = ctk.CTkLabel(drive_row, text="", font=("Segoe UI", 10), text_color=C["muted"])
+        self._files_drive_path_label.pack(side="left", padx=(10, 0))
+        self._update_drive_path_label()
 
-    # ------------------------------------------------------------------
-    # Hydrate card builder
-    # ------------------------------------------------------------------
+        # Toolbar
+        toolbar = ctk.CTkFrame(header_card, fg_color="transparent")
+        toolbar.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 15))
+        ctk.CTkButton(toolbar, text="➕ Add Files", width=110, font=("Segoe UI", 11), fg_color=C["accent"], text_color="#000", hover_color=C["accent2"], command=self._add_files_to_vault).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(toolbar, text="📂 Add Folder", width=110, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._add_folder_to_vault).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(toolbar, text="📤 Export", width=90, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._export_files_vault).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(toolbar, text="📥 Restore from Drive", width=140, font=("Segoe UI", 11), fg_color=C["purple"], hover_color=C["purple2"], command=self._restore_files_from_drive).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(toolbar, text="🔄 Refresh", width=90, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._refresh_files_view).pack(side="left", padx=(0, 8))
+        self._view_toggle_btn = ctk.CTkButton(toolbar, text="☰ List", width=80, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._toggle_files_view_mode)
+        self._view_toggle_btn.pack(side="right")
 
-    def _build_hydrate_card(self, parent: ttk.Frame) -> None:
-        """Build the collapsible Hydrate personalisation card."""
-        # Toggle header — always visible
-        header = tk.Frame(parent, bg="#0f0a1e", cursor="hand2")
-        header.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        header.columnconfigure(1, weight=1)
+        # Scrollable content area
+        content_card = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+        content_card.grid(row=1, column=0, sticky="nsew", padx=10, pady=(8, 0))
+        content_card.grid_columnconfigure(0, weight=1)
+        content_card.grid_rowconfigure(0, weight=1)
+        self._files_scroll = ctk.CTkScrollableFrame(content_card, fg_color="transparent", scrollbar_button_color=C["ghost"], scrollbar_button_hover_color=C["ghost2"])
+        self._files_scroll.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self._files_scroll.grid_columnconfigure(0, weight=1)
+        self._files_empty_label = ctk.CTkLabel(self._files_scroll, text="\n\n📭  Vault is empty\n\nAdd files or folders with the buttons above.\nThey will be encrypted and stored securely.", font=("Segoe UI", 13), text_color=C["muted"], justify="center")
+        self._files_empty_label.grid(row=0, column=0, sticky="nsew", pady=40)
 
-        self._hydrate_arrow = tk.Label(
-            header, text="▶", bg="#0f0a1e", fg="#7c3aed",
-            font=("Segoe UI", 12, "bold"), padx=10, pady=8,
+        # Status bar
+        status_bar = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=8, height=32)
+        status_bar.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 10))
+        status_bar.grid_columnconfigure(0, weight=1)
+        self._files_status_label = ctk.CTkLabel(status_bar, text="0 items  •  Vault not loaded", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
+        self._files_status_label.grid(row=0, column=0, sticky="w", padx=15, pady=6)
+
+    def _get_active_files_vault_path(self) -> Path:
+        """Return the vault path on the currently selected drive."""
+        drive = self._files_drive_var.get().strip() if hasattr(self, "_files_drive_var") else ""
+        if drive:
+            return files_vault_path_for_drive(drive)
+        # Fallback to storage root
+        return files_vault_path(Path(self.storage_var.get()))
+
+    def _update_drive_path_label(self) -> None:
+        if hasattr(self, "_files_drive_path_label") and hasattr(self, "_files_drive_var"):
+            vpath = self._get_active_files_vault_path()
+            exists = "✓ vault exists" if vpath.exists() else "no vault yet"
+            self._files_drive_path_label.configure(text=f"→ {vpath.parent}  [{exists}]")
+
+    def _on_files_drive_changed(self, _val=None) -> None:
+        self._update_drive_path_label()
+        self._log(f"Files drive set to: {self._files_drive_var.get()}")
+
+    def _refresh_drive_list(self) -> None:
+        drives = list_mounted_drives()
+        self._files_drive_combo.configure(values=drives)
+        if drives and self._files_drive_var.get() not in drives:
+            self._files_drive_var.set(drives[0])
+        self._update_drive_path_label()
+        self._log(f"Drives refreshed: {', '.join(drives)}")
+
+    def _restore_files_from_drive(self) -> None:
+        """Decrypt the files vault on the selected drive to a user-chosen folder."""
+        try:
+            password = self._file_vault_password()
+        except ShadowSyncError as exc:
+            messagebox.showerror("ShadowSync", str(exc))
+            return
+        vault_path = self._get_active_files_vault_path()
+        if not vault_path.exists():
+            messagebox.showinfo("ShadowSync", f"No files vault found at:\n{vault_path}\n\nInsert the drive and try again.")
+            return
+        destination = filedialog.askdirectory(title="Restore files to folder")
+        if not destination:
+            return
+        self._set_busy(True, "Restoring files from drive vault...")
+
+        def task() -> None:
+            try:
+                PortableVault(vault_path).extract_to(Path(destination), password)
+                self.log_queue.put(f"Files restored from drive to: {destination}")
+            except ShadowSyncError as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: messagebox.showerror("ShadowSync", m))
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # OS State Tab
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_os_tab(self, parent) -> None:
+        C = self.C
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        # Header card
+        header_card = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+        header_card.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        header_card.grid_columnconfigure(0, weight=1)
+
+        title_row = ctk.CTkFrame(header_card, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 5))
+        title_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(title_row, text="🖥 OS State Hibernation", font=("Segoe UI", 18, "bold"), text_color=C["green"]).grid(row=0, column=0, sticky="w")
+
+        self._os_captured_label = ctk.CTkLabel(
+            header_card,
+            text="Last captured: —",
+            font=("Segoe UI", 11), text_color=C["muted"],
         )
-        self._hydrate_arrow.grid(row=0, column=0)
-        tk.Label(
-            header, text="⚡  Hydrate — Session Personalisation",
-            bg="#0f0a1e", fg="#c4b5fd",
-            font=("Segoe UI", 11, "bold"), pady=8,
-        ).grid(row=0, column=1, sticky="w")
+        self._os_captured_label.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
 
-        # Collapsible body
-        self._hydrate_body = tk.Frame(parent, bg="#0f0a1e")
-        # (not gridded until expanded)
+        # Action buttons
+        actions_f = ctk.CTkFrame(header_card, fg_color="transparent")
+        actions_f.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 15))
+        ctk.CTkButton(actions_f, text="📸 Capture Now", font=("Segoe UI", 13, "bold"), fg_color=C["green"], text_color="#000", hover_color=C["green2"], command=self._capture_os_settings).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(actions_f, text="♻️ Restore from Vault", font=("Segoe UI", 12), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._restore_os_settings).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(actions_f, text="💾 Save to Vault", font=("Segoe UI", 12), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._save_os_settings).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(actions_f, text="📂 Load from Vault", font=("Segoe UI", 12), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._load_os_settings).pack(side="left")
 
-        # Bind toggle
-        for widget in (header, self._hydrate_arrow):
-            widget.bind("<Button-1>", lambda _e: self._toggle_hydrate())
-        for child in header.winfo_children():
-            child.bind("<Button-1>", lambda _e: self._toggle_hydrate())
+        # Scrollable detail area
+        detail_scroll = ctk.CTkScrollableFrame(parent, fg_color=C["card"], corner_radius=12, scrollbar_button_color=C["ghost"], scrollbar_button_hover_color=C["ghost2"])
+        detail_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(8, 10))
+        detail_scroll.grid_columnconfigure(0, weight=1)
 
-        # Build form inside body
-        self._build_hydrate_body(self._hydrate_body)
+        # ── WiFi section ──
+        wifi_header = ctk.CTkFrame(detail_scroll, fg_color="transparent")
+        wifi_header.grid(row=0, column=0, sticky="ew", padx=15, pady=(15, 5))
+        wifi_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(wifi_header, text="📶 WiFi Profiles", font=("Segoe UI", 14, "bold"), text_color=C["accent"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(wifi_header, text="+ Add Manual", width=110, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._add_wifi_row).grid(row=0, column=1, sticky="e")
+        ctk.CTkButton(wifi_header, text="🔍 Scan System", width=110, font=("Segoe UI", 11), fg_color=C["accent"], text_color="#000", hover_color=C["accent2"], command=self._scan_system_wifi).grid(row=0, column=2, padx=(8, 0), sticky="e")
 
-    def _build_hydrate_body(self, parent: tk.Frame) -> None:
-        """Populate the Hydrate card body."""
-        if not _IS_LINUX:
-            # Windows — show disabled notice
-            tk.Label(
-                parent,
-                text="⚠  Hydrate requires Linux / Tails with GNOME and NetworkManager.",
-                bg="#0f0a1e", fg="#6b7a90",
-                font=("Segoe UI", 10), pady=16, padx=16,
-            ).pack(fill="x")
+        self._os_wifi_container = ctk.CTkScrollableFrame(detail_scroll, fg_color=C["sidebar"], corner_radius=8, height=160, scrollbar_button_color=C["ghost"])
+        self._os_wifi_container.grid(row=1, column=0, sticky="ew", padx=15, pady=(0, 10))
+        self._os_wifi_container.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self._os_wifi_container, text="No WiFi profiles. Click 'Scan System' to import from OS.", font=("Segoe UI", 11), text_color=C["muted"]).grid(row=0, column=0, padx=10, pady=10)
+
+        # ── OS details section ──
+        details_card = ctk.CTkFrame(detail_scroll, fg_color=C["sidebar"], corner_radius=8)
+        details_card.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 10))
+        details_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(details_card, text="⚙️ OS Details", font=("Segoe UI", 14, "bold"), text_color=C["accent"]).grid(row=0, column=0, columnspan=2, sticky="w", padx=15, pady=(15, 10))
+
+        fields = [
+            ("THEME", "_os_theme_var", "dark"),
+            ("WALLPAPER PATH", "_os_wallpaper_var", ""),
+            ("HOSTNAME", "_os_hostname_var", platform.node()),
+        ]
+        for i, (lbl, attr, default) in enumerate(fields):
+            r = i + 1
+            ctk.CTkLabel(details_card, text=lbl, font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=r, column=0, sticky="w", padx=(15, 10), pady=6)
+            var = ctk.StringVar(value=default)
+            setattr(self, attr, var)
+            ctk.CTkEntry(details_card, textvariable=var, fg_color=C["input_bg"], border_color=C["ghost"]).grid(row=r, column=1, sticky="ew", padx=(0, 15), pady=6)
+
+        # Env vars
+        ctk.CTkLabel(details_card, text="ENV VARS", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=4, column=0, sticky="nw", padx=(15, 10), pady=6)
+        self._os_env_text = ctk.CTkTextbox(details_card, fg_color=C["input_bg"], text_color=C["text"], font=("Consolas", 11), height=80)
+        self._os_env_text.grid(row=4, column=1, sticky="ew", padx=(0, 15), pady=6)
+        self._os_env_text.insert("end", "# KEY=VALUE (one per line, auto-captured)\n")
+
+        # Registry / Shell RC
+        reg_lbl = "REGISTRY KEYS (Windows)" if _IS_WINDOWS else "SHELL RC (~/.bashrc)"
+        ctk.CTkLabel(details_card, text=reg_lbl, font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=5, column=0, sticky="nw", padx=(15, 10), pady=(6, 15))
+        self._os_extra_text = ctk.CTkTextbox(details_card, fg_color=C["input_bg"], text_color=C["text"], font=("Consolas", 11), height=80)
+        self._os_extra_text.grid(row=5, column=1, sticky="ew", padx=(0, 15), pady=(6, 15))
+        self._os_extra_text.insert("end", "# Captured automatically when you click 'Capture Now'\n")
+
+    def _add_wifi_row(self, ssid: str = "", password: str = "", blob: str = "", auth: str = "") -> None:
+        """Add a WiFi profile row to the OS WiFi container."""
+        C = self.C
+        container = self._os_wifi_container
+        if container is None:
             return
 
-        pad = {"padx": 16, "pady": 4}
+        # Clear placeholder label if first row
+        if not self._os_wifi_rows:
+            for w in container.winfo_children():
+                w.destroy()
 
-        # --- Section: Appearance ---
-        tk.Label(parent, text="APPEARANCE", bg="#0f0a1e", fg="#7c3aed",
-                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=16, pady=(12, 0))
-        sep1 = tk.Frame(parent, bg="#2d1f4a", height=1)
-        sep1.pack(fill="x", padx=16, pady=(2, 6))
+        idx = len(self._os_wifi_rows)
+        row_frame = ctk.CTkFrame(container, fg_color=C["card"], corner_radius=6)
+        row_frame.grid(row=idx, column=0, sticky="ew", padx=5, pady=3)
+        row_frame.grid_columnconfigure(1, weight=1)
 
-        # Dark mode checkbox
-        self._h_darkmode_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            parent, text="Enable dark mode (GNOME)",
-            variable=self._h_darkmode_var,
-            bg="#0f0a1e", fg="#c4b5fd", selectcolor="#1e1535",
-            activebackground="#0f0a1e", activeforeground="#e9d5ff",
-            font=("Segoe UI", 10),
-        ).pack(anchor="w", **pad)
+        ctk.CTkLabel(row_frame, text="📶", font=("Segoe UI", 14), text_color=C["accent"]).grid(row=0, column=0, padx=(10, 5), pady=8)
+        ssid_var = ctk.StringVar(value=ssid)
+        ctk.CTkEntry(row_frame, textvariable=ssid_var, placeholder_text="SSID", fg_color=C["input_bg"], border_color=C["ghost"], width=180).grid(row=0, column=1, sticky="ew", padx=5, pady=8)
+        pwd_var = ctk.StringVar(value=password)
+        ctk.CTkEntry(row_frame, textvariable=pwd_var, placeholder_text="Password (optional)", show="●", fg_color=C["input_bg"], border_color=C["ghost"], width=180).grid(row=0, column=2, padx=5, pady=8)
 
-        # Wallpaper
-        wp_row = tk.Frame(parent, bg="#0f0a1e")
-        wp_row.pack(fill="x", **pad)
-        tk.Label(wp_row, text="Wallpaper path", bg="#0f0a1e", fg="#c4b5fd",
-                 font=("Segoe UI", 10, "bold"), width=18, anchor="w").pack(side="left")
-        self._h_wallpaper_var = tk.StringVar(value="/live/mount/medium/wallpaper.jpg")
-        wp_entry = tk.Entry(
-            wp_row, textvariable=self._h_wallpaper_var,
-            bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
-            relief="flat", font=("Segoe UI", 10), bd=4,
-        )
-        wp_entry.pack(side="left", fill="x", expand=True, padx=(8, 6))
-        tk.Button(
-            wp_row, text="Browse", command=self._h_browse_wallpaper,
-            bg="#1e1535", fg="#c4b5fd", relief="flat",
-            activebackground="#2d1f4a", activeforeground="#e9d5ff",
-            font=("Segoe UI", 9), padx=10, pady=4,
-        ).pack(side="left")
+        # Auth type badge
+        auth_lbl = ctk.CTkLabel(row_frame, text=auth or "—", font=("Segoe UI", 10), text_color=C["muted"], width=60)
+        auth_lbl.grid(row=0, column=3, padx=5, pady=8)
 
-        # --- Section: Wi-Fi ---
-        tk.Label(parent, text="WI-FI PROFILES", bg="#0f0a1e", fg="#7c3aed",
-                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=16, pady=(14, 0))
-        sep2 = tk.Frame(parent, bg="#2d1f4a", height=1)
-        sep2.pack(fill="x", padx=16, pady=(2, 6))
+        # Blob indicator
+        has_blob = bool(blob)
+        blob_lbl = ctk.CTkLabel(row_frame, text="🔑 Profile" if has_blob else "⚠ No profile", font=("Segoe UI", 10), text_color=C["green"] if has_blob else C["muted"], width=80)
+        blob_lbl.grid(row=0, column=4, padx=5, pady=8)
 
-        self._h_wifi_vars: list[tuple[tk.StringVar, tk.StringVar]] = []
-        for i in range(2):
-            row = tk.Frame(parent, bg="#0f0a1e")
-            row.pack(fill="x", **pad)
-            tk.Label(
-                row, text=f"SSID {i + 1}", bg="#0f0a1e", fg="#c4b5fd",
-                font=("Segoe UI", 10, "bold"), width=8, anchor="w",
-            ).pack(side="left")
-            ssid_v = tk.StringVar()
-            tk.Entry(
-                row, textvariable=ssid_v,
-                bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
-                relief="flat", font=("Segoe UI", 10), bd=4, width=20,
-            ).pack(side="left", padx=(8, 8))
-            tk.Label(
-                row, text="Password", bg="#0f0a1e", fg="#c4b5fd",
-                font=("Segoe UI", 10, "bold"),
-            ).pack(side="left")
-            pwd_v = tk.StringVar()
-            tk.Entry(
-                row, textvariable=pwd_v, show="●",
-                bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
-                relief="flat", font=("Segoe UI", 10), bd=4, width=20,
-            ).pack(side="left", padx=(8, 0))
+        def remove_row() -> None:
+            row_data = {"ssid": ssid_var, "password": pwd_var, "blob": blob, "auth": auth, "frame": row_frame}
+            if row_data in self._os_wifi_rows:
+                self._os_wifi_rows.remove(row_data)
+            row_frame.destroy()
+
+        ctk.CTkButton(row_frame, text="✕", width=30, fg_color=C["danger"], hover_color=C["danger2"], command=remove_row, font=("Segoe UI", 12)).grid(row=0, column=5, padx=(5, 10), pady=8)
+
+        self._os_wifi_rows.append({"ssid": ssid_var, "password": pwd_var, "blob": blob, "auth": auth, "frame": row_frame})
+
+    def _scan_system_wifi(self) -> None:
+        """Scan the OS for saved WiFi profiles and populate the list."""
+        password = self.password_var.get()
+        self._set_busy(True, "Scanning system WiFi profiles…")
+        self._log("Scanning system WiFi profiles…")
+
+        def task() -> None:
+            worker = OSSettingsWorker(self.log_queue)
+            try:
+                profiles = worker._capture_wifi()
+                self.after(0, lambda p=profiles: self._populate_wifi_rows(p))
+                self.log_queue.put(f"WiFi scan: found {len(profiles)} profile(s).")
+            except Exception as exc:
+                self.log_queue.put(f"WiFi scan error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _populate_wifi_rows(self, profiles: List[WifiProfile]) -> None:
+        """Clear existing WiFi rows and populate from scanned profiles."""
+        # Clear
+        if self._os_wifi_container:
+            for w in self._os_wifi_container.winfo_children():
+                w.destroy()
+        self._os_wifi_rows.clear()
+        for p in profiles:
+            self._add_wifi_row(ssid=p.ssid, password=p.password_hint, blob=p.blob, auth=p.auth_type)
+        if not profiles:
+            ctk.CTkLabel(self._os_wifi_container, text="No WiFi profiles found.", font=("Segoe UI", 11), text_color=self.C["muted"]).grid(row=0, column=0, padx=10, pady=10)
+
+    def _get_os_wifi_profiles(self) -> List[WifiProfile]:
+        profiles = []
+        for row in self._os_wifi_rows:
+            ssid = row["ssid"].get().strip()
+            if ssid:
+                profiles.append(WifiProfile(
+                    ssid=ssid,
+                    password_hint=row["password"].get(),
+                    blob=row.get("blob", ""),
+                    auth_type=row.get("auth", ""),
+                ))
+        return profiles
+
+    def _capture_os_settings(self) -> None:
+        self._set_busy(True, "Capturing OS state…")
+        self._log("Capturing OS state (WiFi, theme, wallpaper, registry…)")
+
+        def task() -> None:
+            try:
+                worker = OSSettingsWorker(self.log_queue)
+                settings = worker.capture()
+                self._os_settings = settings
+                self.after(0, lambda s=settings: self._populate_os_fields(s))
+                self.log_queue.put(f"OS state captured at {settings.captured_at}")
+            except Exception as exc:
+                self.log_queue.put(f"OS capture error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _populate_os_fields(self, settings: OSSettings) -> None:
+        """Fill OS tab fields from a captured OSSettings object."""
+        self._os_theme_var.set(settings.os_theme)
+        self._os_wallpaper_var.set(settings.wallpaper_path)
+        self._os_hostname_var.set(settings.hostname)
+        # Env vars
+        self._os_env_text.delete("1.0", "end")
+        for k, v in settings.env_vars.items():
+            self._os_env_text.insert("end", f"{k}={v}\n")
+        # Extra (registry / shell rc / aliases / installed apps)
+        self._os_extra_text.delete("1.0", "end")
+        extra_parts: List[str] = []
+        if settings.shell_aliases:
+            extra_parts.append("── Shell Aliases ──")
+            extra_parts.append(settings.shell_aliases[:1500])
+        if _IS_LINUX and settings.shell_rc:
+            extra_parts.append("── Shell RC (excerpt) ──")
+            extra_parts.append(settings.shell_rc[:800])
+        if _IS_WINDOWS and settings.registry_exports:
+            extra_parts.append("── Registry exports ──")
+            for k in settings.registry_exports:
+                extra_parts.append(f"[REG] {k}")
+        if settings.installed_apps:
+            extra_parts.append(f"── Installed Apps ({len(settings.installed_apps)}) ──")
+            extra_parts.extend(settings.installed_apps[:80])
+            if len(settings.installed_apps) > 80:
+                extra_parts.append(f"… and {len(settings.installed_apps) - 80} more")
+        self._os_extra_text.insert("end", "\n".join(extra_parts) or "# Captured automatically when you click 'Capture Now'\n")
+        # WiFi
+        self._populate_wifi_rows(settings.wifi_profiles)
+        # Label — rich summary
+        if self._os_captured_label:
+            self._os_captured_label.configure(
+                text=(
+                    f"Last captured: {settings.captured_at}  •  "
+                    f"{len(settings.wifi_profiles)} WiFi  •  "
+                    f"{len(settings.installed_apps)} apps  •  "
+                    f"host: {settings.hostname}"
+                )
+            )
+        self._os_settings = settings
+
+    def _build_os_settings_from_ui(self) -> OSSettings:
+        """Collect UI fields into an OSSettings object."""
+        settings = self._os_settings or OSSettings()
+        settings.os_theme = self._os_theme_var.get().strip() or "dark"
+        settings.wallpaper_path = self._os_wallpaper_var.get().strip()
+        settings.hostname = self._os_hostname_var.get().strip()
+        settings.wifi_profiles = self._get_os_wifi_profiles()
+        # Parse env vars
+        env: Dict[str, str] = {}
+        for line in self._os_env_text.get("1.0", "end").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip()
+        settings.env_vars = env
+        if not settings.captured_at:
+            settings.captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return settings
+
+    def _save_os_settings(self) -> None:
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("OS State", "Enter the master password first.")
+            return
+        if not storage:
+            messagebox.showerror("OS State", "Choose the ShadowSync storage folder first.")
+            return
+        settings = self._build_os_settings_from_ui()
+        self._set_busy(True, "Saving OS state vault…")
+
+        def task() -> None:
+            try:
+                settings.save(Path(storage), password)
+                self._os_settings = settings
+                self.log_queue.put(f"OS state saved to: {os_settings_vault_path(Path(storage))}")
+            except Exception as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: messagebox.showerror("OS State", m))
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _load_os_settings(self) -> None:
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("OS State", "Enter the master password first.")
+            return
+        if not storage:
+            messagebox.showerror("OS State", "Choose the ShadowSync storage folder first.")
+            return
+        self._set_busy(True, "Loading OS state vault…")
+
+        def task() -> None:
+            try:
+                settings = OSSettings.load(Path(storage), password)
+                self.after(0, lambda s=settings: self._populate_os_fields(s))
+                self.log_queue.put(f"OS state loaded from vault (captured: {settings.captured_at})")
+            except ShadowSyncError as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: messagebox.showerror("OS State", m))
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _restore_os_settings(self) -> None:
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("OS State", "Enter the master password first.")
+            return
+        if not storage:
+            messagebox.showerror("OS State", "Choose the ShadowSync storage folder first.")
+            return
+        vault_path = os_settings_vault_path(Path(storage))
+        if not vault_path.exists():
+            messagebox.showinfo("OS State", "No OS state vault found. Capture and save first.")
+            return
+        if not messagebox.askyesno("OS State", "Restore OS settings from vault?\n\nThis will overwrite WiFi profiles, wallpaper, and other OS settings on this machine."):
+            return
+        self._set_busy(True, "Restoring OS state…")
+
+        def task() -> None:
+            try:
+                settings = OSSettings.load(Path(storage), password)
+                worker = OSSettingsWorker(self.log_queue)
+                worker.restore(settings)
+                self.log_queue.put("OS state restore complete.")
+            except ShadowSyncError as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: messagebox.showerror("OS State", m))
+            except Exception as exc:
+                self.log_queue.put(f"OS restore error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hydrate Tab
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_hydrate_tab(self, parent) -> None:
+        C = self.C
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
+
+        outer_scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent", scrollbar_button_color=C["ghost"], scrollbar_button_hover_color=C["ghost2"])
+        outer_scroll.grid(row=0, column=0, sticky="nsew")
+        outer_scroll.grid_columnconfigure(0, weight=1)
+
+        card = ctk.CTkFrame(outer_scroll, fg_color=C["card"], corner_radius=12)
+        card.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(card, text="⚡ Hydrate — Session Personalisation", font=("Segoe UI", 18, "bold"), text_color=C["purple"]).grid(row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(20, 5))
+
+        if not _IS_LINUX:
+            ctk.CTkLabel(card, text="ℹ GNOME/NetworkManager hooks (dark mode, wallpaper) are Linux/Tails only. Git backup and auto-push work everywhere.", text_color=C["muted"], font=("Segoe UI", 11), wraplength=600, justify="left").grid(row=1, column=0, columnspan=3, sticky="w", padx=20, pady=(0, 10))
+
+        # Appearance
+        ctk.CTkLabel(card, text="APPEARANCE", font=("Segoe UI", 11, "bold"), text_color=C["purple"]).grid(row=2, column=0, sticky="w", padx=20, pady=5)
+        self._h_darkmode_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(card, text="Enable dark mode (GNOME)", variable=self._h_darkmode_var, progress_color=C["purple"]).grid(row=3, column=0, columnspan=3, sticky="w", padx=20, pady=5)
+
+        ctk.CTkLabel(card, text="WALLPAPER", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=4, column=0, sticky="w", padx=20, pady=10)
+        self._h_wallpaper_var = ctk.StringVar(value="/live/mount/medium/wallpaper.jpg")
+        wp_f = ctk.CTkFrame(card, fg_color="transparent")
+        wp_f.grid(row=4, column=1, sticky="ew", pady=10, padx=(0, 20))
+        wp_f.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(wp_f, textvariable=self._h_wallpaper_var, fg_color=C["input_bg"], border_color=C["ghost"]).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(wp_f, text="Browse", width=80, fg_color=C["ghost"], hover_color=C["ghost2"], command=self._h_browse_wallpaper).grid(row=0, column=1, padx=(10, 0))
+
+        # Simple WiFi fallback (Hydrate = quick connect)
+        ctk.CTkLabel(card, text="QUICK WI-FI (FALLBACK)", font=("Segoe UI", 11, "bold"), text_color=C["purple"]).grid(row=5, column=0, sticky="w", padx=20, pady=(20, 5))
+        ctk.CTkLabel(card, text="For full WiFi profile restore with passwords, use the OS State tab.", text_color=C["muted"], font=("Segoe UI", 10)).grid(row=6, column=0, columnspan=3, sticky="w", padx=20, pady=(0, 5))
+        self._h_wifi_vars = []
+        for i in range(3):
+            row = 7 + i
+            ctk.CTkLabel(card, text=f"SSID {i+1}", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=row, column=0, sticky="w", padx=20, pady=5)
+            wifi_f = ctk.CTkFrame(card, fg_color="transparent")
+            wifi_f.grid(row=row, column=1, sticky="ew", pady=5, padx=(0, 20))
+            ssid_v, pwd_v = ctk.StringVar(), ctk.StringVar()
+            ctk.CTkEntry(wifi_f, textvariable=ssid_v, placeholder_text="SSID", fg_color=C["input_bg"], border_color=C["ghost"], width=200).pack(side="left")
+            ctk.CTkLabel(wifi_f, text="Password", font=("Segoe UI", 11, "bold"), text_color=C["label"]).pack(side="left", padx=10)
+            ctk.CTkEntry(wifi_f, textvariable=pwd_v, show="●", fg_color=C["input_bg"], border_color=C["ghost"], width=200).pack(side="left")
             self._h_wifi_vars.append((ssid_v, pwd_v))
 
-        # --- Section: Git ---
-        tk.Label(parent, text="GIT BACKUP", bg="#0f0a1e", fg="#7c3aed",
-                 font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", padx=16, pady=(14, 0))
-        sep3 = tk.Frame(parent, bg="#2d1f4a", height=1)
-        sep3.pack(fill="x", padx=16, pady=(2, 6))
+        # Git Backup
+        ctk.CTkLabel(card, text="GIT BACKUP", font=("Segoe UI", 11, "bold"), text_color=C["purple"]).grid(row=11, column=0, sticky="w", padx=20, pady=(20, 5))
+
+        # Git host selector
+        ctk.CTkLabel(card, text="GIT HOST", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=12, column=0, sticky="w", padx=20, pady=5)
+        self._h_git_host_var = ctk.StringVar(value="github")
+        host_f = ctk.CTkFrame(card, fg_color="transparent")
+        host_f.grid(row=12, column=1, sticky="w", pady=5)
+        for host in ("github", "gitlab", "custom"):
+            ctk.CTkRadioButton(host_f, text=host.capitalize(), variable=self._h_git_host_var, value=host, text_color=C["text"]).pack(side="left", padx=(0, 15))
 
         git_fields = [
-            ("Remote URL",   "_h_git_remote_var",  "",      False),
-            ("Branch",       "_h_git_branch_var",  "main",  False),
-            ("Identity name","_h_git_name_var",    "Tails User", False),
-            ("Identity email","_h_git_email_var",  "",      False),
-            ("Access token (PAT)", "_h_git_token_var", "",  True),
+            ("REMOTE URL", "_h_git_remote_var", "", False),
+            ("BRANCH", "_h_git_branch_var", "main", False),
+            ("IDENTITY NAME", "_h_git_name_var", "ShadowSync User", False),
+            ("IDENTITY EMAIL", "_h_git_email_var", "", False),
+            ("ACCESS TOKEN (PAT)", "_h_git_token_var", "", True),
         ]
-        for label, attr, default, is_secret in git_fields:
-            row = tk.Frame(parent, bg="#0f0a1e")
-            row.pack(fill="x", **pad)
-            tk.Label(
-                row, text=label, bg="#0f0a1e", fg="#c4b5fd",
-                font=("Segoe UI", 10, "bold"), width=18, anchor="w",
-            ).pack(side="left")
-            var = tk.StringVar(value=default)
+        for i, (lbl, attr, default, secret) in enumerate(git_fields):
+            r = 13 + i
+            ctk.CTkLabel(card, text=lbl, font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=r, column=0, sticky="w", padx=20, pady=5)
+            var = ctk.StringVar(value=default)
             setattr(self, attr, var)
-            show = "●" if is_secret else ""
-            tk.Entry(
-                row, textvariable=var, show=show,
-                bg="#1e1535", fg="#e9d5ff", insertbackground="#c4b5fd",
-                relief="flat", font=("Segoe UI", 10), bd=4,
-            ).pack(side="left", fill="x", expand=True, padx=(8, 0))
+            ctk.CTkEntry(card, textvariable=var, show="●" if secret else "", fg_color=C["input_bg"], border_color=C["ghost"]).grid(row=r, column=1, sticky="ew", padx=(0, 20), pady=5)
 
-        # --- Action buttons ---
-        btn_row = tk.Frame(parent, bg="#0f0a1e")
-        btn_row.pack(fill="x", padx=16, pady=(16, 16))
+        # Auto-push options
+        ctk.CTkLabel(card, text="AUTO-PUSH", font=("Segoe UI", 11, "bold"), text_color=C["purple"]).grid(row=19, column=0, sticky="w", padx=20, pady=(20, 5))
+        self._h_auto_push_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(card, text="Auto-push vault to Git on app close / shutdown", variable=self._h_auto_push_var, progress_color=C["purple"], command=self._on_auto_push_toggle).grid(row=20, column=0, columnspan=3, sticky="w", padx=20, pady=5)
+        self._h_push_os_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(card, text="Include OS State vault in auto-push", variable=self._h_push_os_var, progress_color=C["accent"]).grid(row=21, column=0, columnspan=3, sticky="w", padx=20, pady=5)
 
-        def _hbtn(text, cmd, primary=False):
-            bg = "#7c3aed" if primary else "#1e1535"
-            abg = "#6d28d9" if primary else "#2d1f4a"
-            return tk.Button(
-                btn_row, text=text, command=cmd,
-                bg=bg, fg="#ffffff", relief="flat",
-                activebackground=abg, activeforeground="#ffffff",
-                font=("Segoe UI", 10, "bold") if primary else ("Segoe UI", 10),
-                padx=14, pady=8, cursor="hand2",
-            )
+        # Actions
+        actions_f = ctk.CTkFrame(card, fg_color="transparent")
+        actions_f.grid(row=22, column=0, columnspan=3, sticky="w", padx=20, pady=20)
+        ctk.CTkButton(actions_f, text="⚡ Hydrate Now", font=("Segoe UI", 13, "bold"), fg_color=C["purple"], hover_color=C["purple2"], command=self._hydrate_now).pack(side="left")
+        ctk.CTkButton(actions_f, text="💾 Save Config", fg_color=C["ghost"], hover_color=C["ghost2"], command=self._save_hydrate_config).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(actions_f, text="☁ Push to Git Now", fg_color=C["ghost"], hover_color=C["ghost2"], command=self._git_push).pack(side="left", padx=(10, 0))
 
-        _hbtn("⚡ Hydrate Now", self._hydrate_now, primary=True).pack(side="left")
-        _hbtn("💾 Save Config", self._save_hydrate_config).pack(side="left", padx=(10, 0))
-        _hbtn("☁  Push to Git", self._git_push).pack(side="left", padx=(10, 0))
-
-    # ------------------------------------------------------------------
-    # Hydrate card toggle
-    # ------------------------------------------------------------------
-
-    def _toggle_hydrate(self) -> None:
-        if self._hydrate_expanded.get():
-            self._hydrate_body.grid_remove()
-            self._hydrate_arrow.configure(text="▶")
-            self._hydrate_expanded.set(False)
+    def _on_auto_push_toggle(self) -> None:
+        enabled = self._h_auto_push_var.get()
+        cfg = self._hydrate_config
+        if enabled:
+            if not (cfg and cfg.git_remote):
+                self._log("Auto-push: configure a Git remote URL and save the config first.")
+            else:
+                self._log("Auto-push enabled — vault will be pushed to Git when ShadowSync closes.")
+                self._register_shutdown_hook()
         else:
-            self._hydrate_body.grid(row=2, column=0, sticky="ew")
-            self._hydrate_arrow.configure(text="▼")
-            self._hydrate_expanded.set(True)
+            self._log("Auto-push disabled.")
+            _SHUTDOWN_HOOK.unregister()
 
-    # ------------------------------------------------------------------
-    # Hydrate helpers — file browse
-    # ------------------------------------------------------------------
+    def _register_shutdown_hook(self) -> None:
+        """Wire up the shutdown hook to auto-push."""
+        def shutdown_push() -> None:
+            cfg = self._hydrate_config
+            storage = self.storage_var.get().strip()
+            if not cfg or not cfg.git_remote or not storage:
+                return
+            # Count apps
+            apps_root = Path(storage) / "apps"
+            app_count = sum(1 for p in apps_root.iterdir() if p.is_dir()) if apps_root.exists() else 0
+            os_captured = bool(self._os_settings and self._os_settings.captured_at)
+            summary = f"{app_count} apps" + (" | OS state" if os_captured else "")
+            log_q: queue.Queue = queue.Queue()
+            GitPushWorker(Path(storage), cfg, log_q, summary=summary).run()
+
+        _SHUTDOWN_HOOK.register(shutdown_push)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Common UI helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _toggle_password_visibility(self) -> None:
+        self._pw_visible = not self._pw_visible
+        self._pw_entry.configure(show="" if self._pw_visible else "●")
+        self._pw_eye_btn.configure(text_color=self.C["accent"] if self._pw_visible else self.C["label"])
 
     def _h_browse_wallpaper(self) -> None:
         path = filedialog.askopenfilename(
@@ -1615,9 +3117,9 @@ class ShadowSyncApp(tk.Tk):
         if path:
             self._h_wallpaper_var.set(path)
 
-    # ------------------------------------------------------------------
-    # Hydrate — build config from UI fields
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hydrate config serialization
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _ui_to_hydrate_config(self) -> HydrateConfig:
         wifi_profiles = []
@@ -1634,12 +3136,12 @@ class ShadowSyncApp(tk.Tk):
             git_name=self._h_git_name_var.get().strip(),
             git_email=self._h_git_email_var.get().strip(),
             git_token=self._h_git_token_var.get().strip(),
+            git_host=self._h_git_host_var.get().strip(),
+            auto_push_on_close=self._h_auto_push_var.get(),
+            push_includes_os_state=self._h_push_os_var.get(),
         )
 
     def _populate_hydrate_fields(self, cfg: HydrateConfig) -> None:
-        """Fill UI fields from a loaded HydrateConfig (called from background thread via after())."""
-        if not _IS_LINUX:
-            return
         self._h_darkmode_var.set(cfg.dark_mode)
         self._h_wallpaper_var.set(cfg.wallpaper_path)
         for i, (ssid_v, pwd_v) in enumerate(self._h_wifi_vars):
@@ -1654,41 +3156,38 @@ class ShadowSyncApp(tk.Tk):
         self._h_git_name_var.set(cfg.git_name)
         self._h_git_email_var.set(cfg.git_email)
         self._h_git_token_var.set(cfg.git_token)
+        self._h_git_host_var.set(cfg.git_host)
+        self._h_auto_push_var.set(cfg.auto_push_on_close)
+        self._h_push_os_var.set(cfg.push_includes_os_state)
         self._hydrate_config = cfg
-
-    # ------------------------------------------------------------------
-    # Hydrate — background auto-load
-    # ------------------------------------------------------------------
+        if cfg.auto_push_on_close and cfg.git_remote:
+            self._register_shutdown_hook()
 
     def _try_autoload_hydrate(self) -> None:
-        """Silently attempt to load the hydrate config vault in the background."""
         password = self.password_var.get()
         storage = self.storage_var.get().strip()
-        if not password or not storage or not _IS_LINUX:
+        if not password or not storage:
             return
         threading.Thread(target=self._autoload_hydrate_task, daemon=True).start()
 
     def _autoload_hydrate_task(self) -> None:
         try:
-            cfg = HydrateConfig.load(
-                Path(self.storage_var.get()),
-                self.password_var.get(),
-            )
+            cfg = HydrateConfig.load(Path(self.storage_var.get()), self.password_var.get())
             self._hydrate_config = cfg
             self.after(0, lambda: self._populate_hydrate_fields(cfg))
             self.log_queue.put("Hydrate config loaded from vault.")
         except ShadowSyncError:
-            pass  # vault doesn't exist yet — that's fine
+            pass
         except Exception as exc:
             self.log_queue.put(f"Hydrate config auto-load skipped: {exc}")
 
-    # ------------------------------------------------------------------
-    # Hydrate — action handlers
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hydrate action handlers
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _hydrate_now(self) -> None:
         if not _IS_LINUX:
-            messagebox.showinfo("Hydrate", "Hydrate is only available on Linux/Tails.")
+            messagebox.showinfo("Hydrate", "GNOME hooks are only available on Linux/Tails.")
             return
         cfg = self._ui_to_hydrate_config()
         self._log("Hydrate: starting personalisation hooks…")
@@ -1705,9 +3204,6 @@ class ShadowSyncApp(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def _save_hydrate_config(self) -> None:
-        if not _IS_LINUX:
-            messagebox.showinfo("Hydrate", "Hydrate is only available on Linux/Tails.")
-            return
         password = self.password_var.get()
         if not password:
             messagebox.showerror("Hydrate", "Enter the master password first.")
@@ -1724,6 +3220,8 @@ class ShadowSyncApp(tk.Tk):
                 cfg.save(Path(storage), password)
                 self._hydrate_config = cfg
                 self.log_queue.put("Hydrate config saved to encrypted vault.")
+                if cfg.auto_push_on_close and cfg.git_remote:
+                    self.after(0, self._register_shutdown_hook)
             except ShadowSyncError as exc:
                 msg = str(exc)
                 self.after(0, lambda m=msg: messagebox.showerror("Hydrate", m))
@@ -1733,9 +3231,6 @@ class ShadowSyncApp(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def _git_push(self) -> None:
-        if not _IS_LINUX:
-            messagebox.showinfo("Hydrate", "Git push is only available on Linux/Tails.")
-            return
         password = self.password_var.get()
         storage = self.storage_var.get().strip()
         if not password:
@@ -1746,14 +3241,17 @@ class ShadowSyncApp(tk.Tk):
             return
         cfg = self._ui_to_hydrate_config()
         if not cfg.git_remote:
-            messagebox.showerror("Hydrate", "Enter a Git remote URL in the Hydrate section.")
+            messagebox.showerror("Hydrate", "Enter a Git remote URL.")
             return
         self._log("Git Push: preparing vault commit…")
         self._set_busy(True, "Pushing to Git…")
 
         def task() -> None:
             try:
-                GitPushWorker(Path(storage), cfg, self.log_queue).run()
+                apps_root = Path(storage) / "apps"
+                app_count = sum(1 for p in apps_root.iterdir() if p.is_dir()) if apps_root.exists() else 0
+                summary = f"{app_count} apps"
+                GitPushWorker(Path(storage), cfg, self.log_queue, summary=summary).run()
             except Exception as exc:
                 self.log_queue.put(f"Git Push error: {exc}")
             finally:
@@ -1761,51 +3259,9 @@ class ShadowSyncApp(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _field(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, browse) -> ttk.Label:
-        label_widget = ttk.Label(parent, text=label, style="Field.TLabel")
-        label_widget.grid(row=row, column=0, sticky="nw", pady=8, padx=(0, 16))
-        entry = ttk.Entry(parent, textvariable=variable)
-        entry.grid(row=row, column=1, sticky="ew", pady=8)
-        if label == "Profile folder":
-            self.profile_entry = entry
-        if browse:
-            ttk.Button(parent, text="Browse", style="Ghost.TButton", command=browse).grid(row=row, column=2, padx=(10, 0), pady=8)
-        return label_widget
-
-    def _mode_field(self, parent: ttk.Frame, row: int) -> None:
-        ttk.Label(parent, text="Mode", style="Field.TLabel").grid(row=row, column=0, sticky="nw", pady=8, padx=(0, 16))
-        modes = ttk.Frame(parent, style="Card.TFrame")
-        modes.grid(row=row, column=1, sticky="w", pady=8)
-        ttk.Radiobutton(
-            modes,
-            text="DIY sync-on-close",
-            value=MODE_DIY,
-            variable=self.mode_var,
-            command=self._mode_changed,
-        ).grid(row=0, column=0, padx=(0, 18))
-        ttk.Radiobutton(
-            modes,
-            text="On-the-fly FUSE",
-            value=MODE_FUSE,
-            variable=self.mode_var,
-            command=self._mode_changed,
-        ).grid(row=0, column=1)
-
-    def _password_field(self, parent: ttk.Frame, row: int) -> None:
-        ttk.Label(parent, text="Master password", style="Field.TLabel").grid(row=row, column=0, sticky="nw", pady=8, padx=(0, 16))
-        ttk.Entry(parent, textvariable=self.password_var, show="*").grid(row=row, column=1, sticky="ew", pady=8)
-
-    def _profile_name_field(self, parent: ttk.Frame, row: int) -> None:
-        ttk.Label(parent, text="Profile name", style="Field.TLabel").grid(row=row, column=0, sticky="nw", pady=8, padx=(0, 16))
-        self.profile_combo = ttk.Combobox(parent, textvariable=self.profile_name_var, values=["Default"])
-        self.profile_combo.grid(row=row, column=1, sticky="ew", pady=8)
-        ttk.Button(parent, text="Refresh", style="Ghost.TButton", command=self._refresh_profile_names).grid(row=row, column=2, padx=(10, 0), pady=8)
-
-    def _preset_field(self, parent: ttk.Frame, row: int) -> None:
-        ttk.Label(parent, text="Preset", style="Field.TLabel").grid(row=row, column=0, sticky="nw", pady=8, padx=(0, 16))
-        preset = ttk.Combobox(parent, textvariable=self.profile_kind_var, values=list(self.presets), state="readonly")
-        preset.grid(row=row, column=1, sticky="ew", pady=8)
-        preset.bind("<<ComboboxSelected>>", self._preset_changed)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Browse / vault action handlers
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _preset_changed(self, _event: object) -> None:
         preset_name = self.profile_kind_var.get()
@@ -1861,10 +3317,9 @@ class ShadowSyncApp(tk.Tk):
             self._log("FUSE mode selected. This requires Linux/Tails with gocryptfs.")
         else:
             self._log("DIY sync-on-close mode selected.")
-        # When password is already entered and mode is changed, try to auto-load hydrate
         self._try_autoload_hydrate()
 
-    def _options(self) -> RunOptions:
+    def _build_run_options(self) -> RunOptions:
         if not self.password_var.get():
             raise ShadowSyncError("Enter the master password first.")
         if not self.exec_var.get():
@@ -1900,15 +3355,16 @@ class ShadowSyncApp(tk.Tk):
             messagebox.showinfo("ShadowSync", "ShadowSync is already running.")
             return
         try:
-            options = self._options()
+            options = self._build_run_options()
         except ShadowSyncError as exc:
             messagebox.showerror("ShadowSync", str(exc))
             return
         self.worker = ShadowSyncWorker(options, self.log_queue)
         self.worker_thread = threading.Thread(target=self._run_worker, daemon=True)
         self.worker_thread.start()
-        self.state_label.configure(text="Running")
-        # Auto-load hydrate config now that we know password + storage are valid
+        C = self.C
+        self.state_label.configure(text="Running", text_color=C["run_green"])
+        self._status_dot.configure(text_color=C["run_green"])
         self._try_autoload_hydrate()
 
     def _run_worker(self) -> None:
@@ -1932,9 +3388,9 @@ class ShadowSyncApp(tk.Tk):
             if self.worker and self.worker_thread and self.worker_thread.is_alive():
                 self.worker.save_now()
             else:
-                options = self._options()
+                options = self._build_run_options()
                 if options.mode == MODE_FUSE:
-                    raise ShadowSyncError("FUSE mode saves on the fly. Launch it first, then use Save Vault Now to flush writes.")
+                    raise ShadowSyncError("FUSE mode saves on the fly. Launch it first.")
                 self._set_busy(True, "Encrypting portable vault...")
 
                 def save_task() -> None:
@@ -1951,6 +3407,10 @@ class ShadowSyncApp(tk.Tk):
                 threading.Thread(target=save_task, daemon=True).start()
         except ShadowSyncError as exc:
             messagebox.showerror("ShadowSync", str(exc))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Files tab actions
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _add_files_to_vault(self) -> None:
         try:
@@ -1983,9 +3443,9 @@ class ShadowSyncApp(tk.Tk):
         destination = filedialog.askdirectory(title="Choose export folder")
         if not destination:
             return
-        vault = PortableVault(files_vault_path(Path(self.storage_var.get())))
+        vault = PortableVault(self._get_active_files_vault_path())
         if not vault.exists():
-            messagebox.showinfo("ShadowSync", "No manual files vault exists yet.")
+            messagebox.showinfo("ShadowSync", "No manual files vault exists on the selected drive yet.")
             return
         self._set_busy(True, "Decrypting manual files vault...")
 
@@ -2002,7 +3462,9 @@ class ShadowSyncApp(tk.Tk):
         threading.Thread(target=export_task, daemon=True).start()
 
     def _import_manual_items(self, sources: list[Path], password: str) -> None:
-        vault = PortableVault(files_vault_path(Path(self.storage_var.get())))
+        vault_path = self._get_active_files_vault_path()
+        vault_path.parent.mkdir(parents=True, exist_ok=True)
+        vault = PortableVault(vault_path)
         self._set_busy(True, "Encrypting manual files vault...")
 
         def import_task() -> None:
@@ -2010,15 +3472,27 @@ class ShadowSyncApp(tk.Tk):
             try:
                 if vault.exists():
                     vault.restore_to(staging, password)
+                added_names = []
                 for source in sources:
-                    copy_into_unique(source.expanduser().resolve(), staging)
+                    resolved = source.expanduser().resolve()
+                    added_names.append(resolved.name)
+                    copy_into_unique(resolved, staging)
                 vault.save_from(staging, password)
-                self.log_queue.put(f"Added {len(sources)} item(s) to manual files vault: {vault.path}")
+                if vault_path.exists():
+                    vault_size = vault_path.stat().st_size
+                    size_str = self._format_file_size(vault_size)
+                    self.log_queue.put(f"Added {len(sources)} item(s) to drive vault: {', '.join(added_names)}  [vault size: {size_str}]")
+                else:
+                    self.log_queue.put(f"Warning: vault file not found after save at {vault_path}")
+                self.after(100, self._refresh_files_view)
+                self.after(100, self._update_drive_path_label)
             except ShadowSyncError as exc:
                 message = str(exc)
+                self.log_queue.put(f"Error: {message}")
                 self.after(0, lambda message=message: messagebox.showerror("ShadowSync", message))
             except OSError as exc:
                 message = f"File import failed: {exc}"
+                self.log_queue.put(f"Error: {message}")
                 self.after(0, lambda message=message: messagebox.showerror("ShadowSync", message))
             finally:
                 wipe_directory(staging)
@@ -2030,9 +3504,11 @@ class ShadowSyncApp(tk.Tk):
         password = self.password_var.get()
         if not password:
             raise ShadowSyncError("Enter the master password first.")
-        if not self.storage_var.get().strip():
-            raise ShadowSyncError("Choose the ShadowSync storage folder first.")
         return password
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Worker controls
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _stop_worker(self) -> None:
         if self.worker:
@@ -2049,12 +3525,366 @@ class ShadowSyncApp(tk.Tk):
         self._log("Panic requested. Closing ShadowSync.")
         self.after(250, self.destroy)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # History Tab — Git commit timeline with per-app and per-OS restore
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_history_tab(self, parent) -> None:
+        C = self.C
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        # Header
+        header_card = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+        header_card.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        header_card.grid_columnconfigure(0, weight=1)
+
+        title_row = ctk.CTkFrame(header_card, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 5))
+        title_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(title_row, text="📜 Backup History — Git Timeline", font=("Segoe UI", 18, "bold"), text_color=C["accent"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(title_row, text="🔄 Refresh History", width=140, font=("Segoe UI", 12), fg_color=C["ghost"], hover_color=C["ghost2"], command=self._refresh_history).grid(row=0, column=1, sticky="e")
+
+        ctk.CTkLabel(header_card, text="Each auto-push creates a timestamped branch. Click a commit to see its contents and restore individual app vaults or OS settings.",
+                     text_color=C["muted"], font=("Segoe UI", 11), wraplength=780, justify="left").grid(row=1, column=0, sticky="w", padx=20, pady=(0, 15))
+
+        # Commit list (left) + detail panel (right)
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=10, pady=(8, 10))
+        body.grid_columnconfigure(0, weight=2)
+        body.grid_columnconfigure(1, weight=3)
+        body.grid_rowconfigure(0, weight=1)
+
+        # ── Left: commit list ──
+        commits_card = ctk.CTkFrame(body, fg_color=C["card"], corner_radius=12)
+        commits_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        commits_card.grid_columnconfigure(0, weight=1)
+        commits_card.grid_rowconfigure(0, weight=1)
+
+        ctk.CTkLabel(commits_card, text="Backup Commits", font=("Segoe UI", 13, "bold"), text_color=C["label"]).pack(anchor="w", padx=15, pady=(12, 5))
+        self._history_scroll = ctk.CTkScrollableFrame(commits_card, fg_color="transparent", scrollbar_button_color=C["ghost"])
+        self._history_scroll.pack(fill="both", expand=True, padx=5, pady=(0, 10))
+        self._history_scroll.grid_columnconfigure(0, weight=1)
+        self._history_commits_frame = self._history_scroll
+
+        self._history_empty_label = ctk.CTkLabel(
+            self._history_scroll,
+            text="No backup history yet.\n\nPush to Git first or click Refresh.",
+            font=("Segoe UI", 12), text_color=C["muted"], justify="center",
+        )
+        self._history_empty_label.grid(row=0, column=0, pady=30)
+        self._history_commit_list: List[GitCommitInfo] = []
+        self._history_selected_commit: Optional[GitCommitInfo] = None
+
+        # ── Right: detail panel ──
+        detail_card = ctk.CTkFrame(body, fg_color=C["card"], corner_radius=12)
+        detail_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        detail_card.grid_columnconfigure(0, weight=1)
+        detail_card.grid_rowconfigure(1, weight=1)
+
+        detail_header = ctk.CTkFrame(detail_card, fg_color="transparent")
+        detail_header.pack(fill="x", padx=15, pady=(12, 5))
+        self._history_detail_title = ctk.CTkLabel(detail_header, text="Select a commit →", font=("Segoe UI", 13, "bold"), text_color=C["label"])
+        self._history_detail_title.pack(anchor="w")
+        self._history_detail_date = ctk.CTkLabel(detail_header, text="", font=("Segoe UI", 11), text_color=C["muted"])
+        self._history_detail_date.pack(anchor="w")
+
+        self._history_detail_scroll = ctk.CTkScrollableFrame(detail_card, fg_color="transparent", scrollbar_button_color=C["ghost"])
+        self._history_detail_scroll.pack(fill="both", expand=True, padx=5, pady=(0, 10))
+        self._history_detail_scroll.grid_columnconfigure(0, weight=1)
+
+    def _refresh_history(self) -> None:
+        storage = self.storage_var.get().strip()
+        if not storage:
+            self._log("Choose the ShadowSync storage folder first.")
+            return
+        self._log("Loading Git history...")
+        self._set_busy(True, "Fetching commit history...")
+
+        def task() -> None:
+            try:
+                worker = GitHistoryWorker(Path(storage), self.log_queue)
+                commits = worker.fetch_commits()
+                self.after(0, lambda c=commits: self._render_history(c))
+            except Exception as exc:
+                self.log_queue.put(f"Git history error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _render_history(self, commits: List[GitCommitInfo]) -> None:
+        C = self.C
+        frame = self._history_commits_frame
+        for w in frame.winfo_children():
+            w.destroy()
+
+        self._history_commit_list = commits
+
+        if not commits:
+            ctk.CTkLabel(frame, text="No backup history found.\n\nPush to Git with auto-push enabled\nto build a timeline.", font=("Segoe UI", 12), text_color=C["muted"], justify="center").grid(row=0, column=0, pady=30)
+            return
+
+        self._log(f"Git history: {len(commits)} backup commit(s) found.")
+        for idx, commit in enumerate(commits):
+            is_backup = "backup-" in commit.branch
+            branch_short = commit.branch.replace("remotes/origin/", "").replace("origin/", "")
+            date_short = commit.author_date[:16] if len(commit.author_date) >= 16 else commit.author_date
+
+            row = ctk.CTkFrame(frame, fg_color=C["sidebar"] if idx % 2 == 0 else C["card"], corner_radius=8, cursor="hand2")
+            row.grid(row=idx, column=0, sticky="ew", padx=4, pady=3)
+            row.grid_columnconfigure(1, weight=1)
+
+            # Branch icon
+            icon = "☁" if is_backup else "🔖"
+            icon_color = C["accent"] if is_backup else C["purple"]
+            ctk.CTkLabel(row, text=icon, font=("Segoe UI", 16), text_color=icon_color, width=30).grid(row=0, column=0, padx=(10, 5), pady=10, rowspan=2)
+
+            ctk.CTkLabel(row, text=branch_short, font=("Segoe UI", 11, "bold"), text_color=C["text"], anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=(10, 0))
+            subject_short = commit.subject[:60] + ("…" if len(commit.subject) > 60 else "")
+            ctk.CTkLabel(row, text=subject_short, font=("Segoe UI", 10), text_color=C["muted"], anchor="w").grid(row=1, column=1, sticky="w", padx=5, pady=(0, 10))
+
+            badges = ctk.CTkFrame(row, fg_color="transparent")
+            badges.grid(row=0, column=2, rowspan=2, padx=(5, 10), pady=8)
+            if commit.has_apps:
+                ctk.CTkLabel(badges, text=f"📦 {len(commit.app_names)}", font=("Segoe UI", 10), text_color=C["green"], width=50).pack()
+            if commit.has_os:
+                ctk.CTkLabel(badges, text="🖥 OS", font=("Segoe UI", 10), text_color=C["purple"], width=50).pack()
+
+            ctk.CTkLabel(row, text=date_short, font=("Segoe UI", 9), text_color=C["log_ts"], width=110, anchor="e").grid(row=0, column=3, rowspan=2, padx=(0, 10), pady=10)
+
+            row.bind("<Button-1>", lambda e, c=commit: self._select_history_commit(c))
+            for child in row.winfo_children():
+                child.bind("<Button-1>", lambda e, c=commit: self._select_history_commit(c))
+
+    def _select_history_commit(self, commit: GitCommitInfo) -> None:
+        C = self.C
+        self._history_selected_commit = commit
+        branch_short = commit.branch.replace("remotes/origin/", "").replace("origin/", "")
+        self._history_detail_title.configure(text=f"🔍 {branch_short}", text_color=C["accent"])
+        self._history_detail_date.configure(text=f"{commit.author_date[:19]}  •  commit {commit.commit_hash[:8]}")
+
+        detail_frame = self._history_detail_scroll
+        for w in detail_frame.winfo_children():
+            w.destroy()
+
+        row_idx = 0
+
+        # ── Subject ──
+        ctk.CTkLabel(detail_frame, text="Commit message", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=row_idx, column=0, sticky="w", padx=10, pady=(10, 2))
+        row_idx += 1
+        ctk.CTkLabel(detail_frame, text=commit.subject, font=("Segoe UI", 11), text_color=C["text"], wraplength=400, justify="left").grid(row=row_idx, column=0, sticky="w", padx=10, pady=(0, 10))
+        row_idx += 1
+
+        # ── OS State restore ──
+        if commit.has_os:
+            os_card = ctk.CTkFrame(detail_frame, fg_color=C["sidebar"], corner_radius=8)
+            os_card.grid(row=row_idx, column=0, sticky="ew", padx=8, pady=5)
+            os_card.grid_columnconfigure(0, weight=1)
+            row_idx += 1
+            ctk.CTkLabel(os_card, text="🖥 OS Settings", font=("Segoe UI", 13, "bold"), text_color=C["green"]).grid(row=0, column=0, sticky="w", padx=15, pady=(12, 5))
+            ctk.CTkLabel(os_card, text="WiFi profiles, wallpaper, env vars, installed apps, shell config", font=("Segoe UI", 10), text_color=C["muted"]).grid(row=1, column=0, sticky="w", padx=15, pady=(0, 5))
+            ctk.CTkButton(
+                os_card, text="♻️ Restore OS Settings from this commit",
+                font=("Segoe UI", 11), fg_color=C["green"], text_color="#000", hover_color=C["green2"],
+                command=lambda c=commit: self._restore_os_from_commit(c),
+            ).grid(row=2, column=0, sticky="w", padx=15, pady=(5, 12))
+
+        # ── App vaults ──
+        if commit.app_names:
+            ctk.CTkLabel(detail_frame, text=f"📦 Apps in this backup ({len(commit.app_names)})", font=("Segoe UI", 13, "bold"), text_color=C["accent"]).grid(row=row_idx, column=0, sticky="w", padx=10, pady=(10, 5))
+            row_idx += 1
+
+            for app_safe_name in commit.app_names:
+                app_display = display_app_name(app_safe_name)
+                app_card = ctk.CTkFrame(detail_frame, fg_color=C["sidebar"], corner_radius=8)
+                app_card.grid(row=row_idx, column=0, sticky="ew", padx=8, pady=4)
+                app_card.grid_columnconfigure(0, weight=1)
+                row_idx += 1
+
+                info_row = ctk.CTkFrame(app_card, fg_color="transparent")
+                info_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 5))
+                info_row.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(info_row, text=f"📦 {app_display}", font=("Segoe UI", 12, "bold"), text_color=C["text"]).grid(row=0, column=0, sticky="w")
+                ctk.CTkLabel(info_row, text=f"({app_safe_name})", font=("Segoe UI", 10), text_color=C["muted"]).grid(row=1, column=0, sticky="w")
+
+                btn_row = ctk.CTkFrame(app_card, fg_color="transparent")
+                btn_row.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+                ctk.CTkButton(
+                    btn_row, text="♻️ Restore Default Profile",
+                    width=170, font=("Segoe UI", 11), fg_color=C["accent"], text_color="#000", hover_color=C["accent2"],
+                    command=lambda c=commit, a=app_safe_name: self._restore_app_from_commit(c, a, "Default"),
+                ).pack(side="left", padx=(0, 8))
+                ctk.CTkButton(
+                    btn_row, text="📂 Restore to Folder…",
+                    width=150, font=("Segoe UI", 11), fg_color=C["ghost"], hover_color=C["ghost2"],
+                    command=lambda c=commit, a=app_safe_name: self._restore_app_from_commit_pick(c, a),
+                ).pack(side="left")
+
+        if not commit.has_os and not commit.app_names:
+            ctk.CTkLabel(detail_frame, text="This commit has no app vaults or OS settings.", font=("Segoe UI", 12), text_color=C["muted"]).grid(row=row_idx, column=0, padx=10, pady=20)
+
+    def _restore_app_from_commit(self, commit: GitCommitInfo, app_safe_name: str, profile_name: str = "Default") -> None:
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("History", "Enter the master password first.")
+            return
+        if not storage:
+            messagebox.showerror("History", "Choose the ShadowSync storage folder.")
+            return
+        destination = Path(storage) / "apps" / app_safe_name / "profiles" / profile_name / "restored_data"
+        if not messagebox.askyesno("History — Restore App",
+            f"Restore '{display_app_name(app_safe_name)}' ({profile_name}) from commit {commit.commit_hash[:8]}?\n\n"
+            f"Files will be extracted to:\n{destination}\n\n"
+            "Existing files will NOT be overwritten."):
+            return
+        self._set_busy(True, f"Restoring {display_app_name(app_safe_name)} from history…")
+
+        def task() -> None:
+            try:
+                worker = GitRestoreWorker(Path(storage), self.log_queue)
+                ok = worker.restore_app_vault(commit.commit_hash, app_safe_name, profile_name, destination, password)
+                if ok:
+                    self.log_queue.put(f"App '{display_app_name(app_safe_name)}' restored from commit {commit.commit_hash[:8]} → {destination}")
+                else:
+                    self.log_queue.put(f"Restore failed for '{app_safe_name}' — vault not found in that commit.")
+            except Exception as exc:
+                self.log_queue.put(f"Restore error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _restore_app_from_commit_pick(self, commit: GitCommitInfo, app_safe_name: str) -> None:
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("History", "Enter the master password first.")
+            return
+        destination = filedialog.askdirectory(title=f"Restore {display_app_name(app_safe_name)} to folder")
+        if not destination:
+            return
+        self._set_busy(True, f"Restoring {display_app_name(app_safe_name)}…")
+
+        def task() -> None:
+            try:
+                worker = GitRestoreWorker(Path(storage), self.log_queue)
+                # Try all profiles
+                paths_root = Path(storage) / "apps" / app_safe_name / "profiles"
+                profiles_tried = []
+                r = subprocess.run(
+                    ["git", "-C", storage, "ls-tree", "--name-only", f"{commit.commit_hash}:apps/{app_safe_name}/profiles"],
+                    capture_output=True, text=True, check=False,
+                )
+                profile_names = [n.strip() for n in r.stdout.splitlines() if n.strip()] if r.returncode == 0 else ["Default"]
+                for pname in profile_names:
+                    ok = worker.restore_app_vault(commit.commit_hash, app_safe_name, pname, Path(destination) / pname, password)
+                    if ok:
+                        profiles_tried.append(pname)
+                if profiles_tried:
+                    self.log_queue.put(f"Restored profiles: {', '.join(profiles_tried)} → {destination}")
+                else:
+                    self.log_queue.put(f"No profiles found in commit {commit.commit_hash[:8]} for {app_safe_name}.")
+            except Exception as exc:
+                self.log_queue.put(f"Restore error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _restore_os_from_commit(self, commit: GitCommitInfo) -> None:
+        password = self.password_var.get()
+        storage = self.storage_var.get().strip()
+        if not password:
+            messagebox.showerror("History", "Enter the master password first.")
+            return
+        if not messagebox.askyesno("History — Restore OS Settings",
+            f"Restore OS settings from commit {commit.commit_hash[:8]}?\n\n"
+            "This will:\n• Load WiFi profiles from that snapshot\n• Update the OS State tab fields\n• NOT immediately apply to the OS (use OS State → Restore for that)"):
+            return
+        self._set_busy(True, "Restoring OS settings from history…")
+
+        def task() -> None:
+            try:
+                worker = GitRestoreWorker(Path(storage), self.log_queue)
+                settings = worker.restore_os_vault(commit.commit_hash, Path(storage), password)
+                if settings:
+                    self.after(0, lambda s=settings: self._populate_os_fields(s))
+                    self.log_queue.put(f"OS settings loaded from commit {commit.commit_hash[:8]}. "
+                                       f"Review in the OS State tab, then click 'Restore from Vault' to apply.")
+                else:
+                    self.log_queue.put(f"OS settings vault not found in commit {commit.commit_hash[:8]}.")
+            except Exception as exc:
+                self.log_queue.put(f"OS restore from history error: {exc}")
+            finally:
+                self.log_queue.put(("busy", False, ""))
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _on_close(self) -> None:
+        """Handle window close — optionally auto-push before exiting."""
         if self.worker and self.worker_thread and self.worker_thread.is_alive():
             if not messagebox.askyesno("ShadowSync", "Stop the running app and close ShadowSync?"):
                 return
             self.worker.stop()
+
+        cfg = self._hydrate_config
+        storage = self.storage_var.get().strip()
+        password = self.password_var.get()
+
+        if cfg and cfg.auto_push_on_close and cfg.git_remote and storage and password:
+            if messagebox.askyesno(
+                "ShadowSync — Auto Push",
+                "Auto-push is enabled.\n\nPush vault to Git before closing?\n(This may take a few seconds)",
+                icon="question",
+            ):
+                self._do_auto_push_then_close(cfg, storage, password)
+                return
+
         self.destroy()
+
+    def _do_auto_push_then_close(self, cfg: HydrateConfig, storage: str, password: str) -> None:
+        """Show a progress dialog, push in background, then destroy."""
+        C = self.C
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Auto-pushing…")
+        dlg.geometry("420x140")
+        dlg.configure(fg_color=C["bg"])
+        dlg.transient(self)
+        dlg.grab_set()
+        ctk.CTkLabel(dlg, text="☁ Pushing vault to Git…", font=("Segoe UI", 14, "bold"), text_color=C["accent"]).pack(pady=(20, 10))
+        bar = ctk.CTkProgressBar(dlg, mode="indeterminate", progress_color=C["accent"])
+        bar.pack(fill="x", padx=30, pady=5)
+        bar.start()
+        self._push_status_label = ctk.CTkLabel(dlg, text="Preparing…", font=("Segoe UI", 11), text_color=C["muted"])
+        self._push_status_label.pack()
+
+        def task() -> None:
+            log_q: queue.Queue = queue.Queue()
+            try:
+                apps_root = Path(storage) / "apps"
+                app_count = sum(1 for p in apps_root.iterdir() if p.is_dir()) if apps_root.exists() else 0
+                os_state_note = " | OS state" if (self._os_settings and self._os_settings.captured_at) else ""
+                summary = f"{app_count} apps{os_state_note}"
+                GitPushWorker(Path(storage), cfg, log_q, summary=summary).run()
+                # Drain log
+                msgs = []
+                while not log_q.empty():
+                    msgs.append(str(log_q.get_nowait()))
+                last = msgs[-1] if msgs else "Done."
+                self.after(0, lambda m=last: self._push_status_label.configure(text=m, text_color=self.C["log_ok"]))
+            except Exception as exc:
+                self.after(0, lambda e=str(exc): self._push_status_label.configure(text=f"Push error: {e}", text_color=self.C["log_err"]))
+            finally:
+                bar.stop()
+                self.after(1200, lambda: (dlg.destroy(), self.destroy()))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Log / drain
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _drain_log(self) -> None:
         while True:
@@ -2073,21 +3903,37 @@ class ShadowSyncApp(tk.Tk):
 
     def _log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{timestamp}] {message}\n")
+        msg_lower = message.lower()
+        if "error" in msg_lower or "wrong" in msg_lower or "fail" in msg_lower or "blocked" in msg_lower:
+            body_tag = "err"
+        elif "done" in msg_lower or "saved" in msg_lower or "trusted" in msg_lower or "locked" in msg_lower or "mounted" in msg_lower or "restored" in msg_lower or "captured" in msg_lower:
+            body_tag = "ok"
+        elif "warning" in msg_lower or "skipped" in msg_lower or "panic" in msg_lower:
+            body_tag = "warn"
+        elif "ready" in msg_lower or "scanning" in msg_lower or "calculating" in msg_lower or "loading" in msg_lower:
+            body_tag = "info"
+        else:
+            body_tag = "body"
+        self.log_text.insert("end", f"[{timestamp}] ", "ts")
+        self.log_text.insert("end", f"{message}\n", body_tag)
         self.log_text.see("end")
 
     def _set_busy(self, active: bool, message: str = "") -> None:
+        C = self.C
         if active:
             self.progress.grid()
             self.progress.start(12)
-            self.state_label.configure(text=message or "Working")
+            self.state_label.configure(text=message or "Working", text_color=C["accent"])
+            self._status_dot.configure(text_color=C["accent"])
         else:
             self.progress.stop()
             self.progress.grid_remove()
             if self.worker_thread and self.worker_thread.is_alive():
-                self.state_label.configure(text="Running")
+                self.state_label.configure(text="Running", text_color=C["run_green"])
+                self._status_dot.configure(text_color=C["run_green"])
             else:
-                self.state_label.configure(text="Locked")
+                self.state_label.configure(text="Locked", text_color=C["lock_blue"])
+                self._status_dot.configure(text_color=C["lock_blue"])
 
     def _verify_executable_then(self, executable: Path, app_name: str, on_accept, on_reject=None) -> None:
         password = self.password_var.get()
@@ -2143,8 +3989,9 @@ class ShadowSyncApp(tk.Tk):
             on_reject()
 
     def _pulse_heartbeat(self) -> None:
-        self.heartbeat_dot.configure(text="● Heartbeat checked", fg="#22c55e")
-        self.after(900, lambda: self.heartbeat_dot.configure(text="● Heartbeat active", fg="#8ee7d3"))
+        C = self.C
+        self.heartbeat_dot.configure(text="● Heartbeat saved", text_color=C["run_green"])
+        self.after(1200, lambda: self.heartbeat_dot.configure(text="● Heartbeat active", text_color=C["accent"]))
 
     def _refresh_profile_names(self) -> None:
         app_name = self.app_name_var.get().strip() or "CustomApp"
@@ -2241,6 +4088,349 @@ class ShadowSyncApp(tk.Tk):
         entry.focus_set()
         entry.selection_range(0, "end")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Storage scan
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _start_storage_scan(self) -> None:
+        current = Path(self.storage_var.get()).expanduser().resolve()
+        if current.exists() and is_valid_shadowsync_store(current):
+            self._log(f"Storage folder found at: {current}")
+            self._update_drive_label(current)
+            return
+        self._log("Scanning drives for ShadowSync storage...")
+        threading.Thread(target=self._scan_storage_roots, daemon=True).start()
+
+    def _scan_storage_roots(self) -> None:
+        try:
+            stores = find_shadowsync_stores(max_depth=3)
+        except Exception as exc:
+            self.log_queue.put(f"Storage scan error: {exc}")
+            return
+        if not stores:
+            self.log_queue.put("No existing ShadowSync storage found. Using default location.")
+            return
+        if len(stores) == 1:
+            store = stores[0]
+            self.log_queue.put(f"Auto-detected storage: {store}")
+            self.after(0, lambda s=str(store): self._apply_detected_storage(s))
+        else:
+            self.log_queue.put(f"Found {len(stores)} ShadowSync storage locations.")
+            self.after(0, lambda ss=stores: self._prompt_detected_storage(ss))
+
+    def _apply_detected_storage(self, path: str) -> None:
+        self.storage_var.set(path)
+        self.approved_executable_path = ""
+        self.approved_storage_root = ""
+        self.sandbox_next_launch = False
+        self._log(f"Storage folder auto-set to: {path}")
+        self._update_drive_label(Path(path))
+
+    def _update_drive_label(self, path: Path) -> None:
+        try:
+            drive = path.anchor or str(path)
+            self._drive_label.configure(text=f"💾 Drive: {drive}")
+        except Exception:
+            pass
+
+    def _prompt_detected_storage(self, stores: list[Path]) -> None:
+        C = self.C
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("ShadowSync — Select Storage")
+        dialog.geometry("620x440")
+        dialog.configure(fg_color=C["bg"])
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.lift()
+        dialog.focus_force()
+
+        ctk.CTkLabel(dialog, text="🔍 Multiple Storage Locations Found", font=("Segoe UI", 16, "bold"), text_color=C["accent"]).pack(padx=20, pady=(20, 5))
+        ctk.CTkLabel(dialog, text="ShadowSync found encrypted vaults on multiple drives.\nSelect which one to use:", text_color=C["muted"], font=("Segoe UI", 11)).pack(padx=20, pady=(0, 15))
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color=C["card"], corner_radius=10)
+        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        scroll.grid_columnconfigure(0, weight=1)
+
+        selected_var = ctk.StringVar(value=str(stores[0]))
+
+        for idx, store in enumerate(stores):
+            store_str = str(store)
+            apps_dir = store / "apps"
+            app_count = 0
+            if apps_dir.exists():
+                app_count = sum(1 for p in apps_dir.iterdir() if p.is_dir())
+            files_vault = store / "files" / "manual-files.ssvault"
+            has_files = files_vault.exists()
+            os_vault = store / "os_settings" / "os_state.ssvault"
+            has_os = os_vault.exists()
+
+            parts = []
+            if app_count:
+                parts.append(f"{app_count} app{'s' if app_count != 1 else ''}")
+            if has_files:
+                parts.append("files vault")
+            if has_os:
+                parts.append("OS state")
+            if (store / "user_registry.enc").exists():
+                parts.append("TOFU registry")
+            detail = ", ".join(parts) if parts else "empty store"
+
+            row = ctk.CTkFrame(scroll, fg_color=C["sidebar"], corner_radius=8)
+            row.grid(row=idx, column=0, sticky="ew", padx=5, pady=4)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkRadioButton(row, text="", variable=selected_var, value=store_str, fg_color=C["accent"], border_color=C["ghost"], width=20).grid(row=0, column=0, padx=(15, 5), pady=12, rowspan=2)
+            ctk.CTkLabel(row, text=store_str, font=("Segoe UI", 12, "bold"), text_color=C["text"], anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=(12, 0))
+            ctk.CTkLabel(row, text=f"📦 {detail}", font=("Segoe UI", 11), text_color=C["muted"], anchor="w").grid(row=1, column=1, sticky="w", padx=5, pady=(0, 12))
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(padx=20, pady=(0, 20))
+
+        def apply_selection() -> None:
+            self._apply_detected_storage(selected_var.get())
+            dialog.destroy()
+
+        def use_default() -> None:
+            self._log("Using default storage location.")
+            dialog.destroy()
+
+        ctk.CTkButton(btn_frame, text="✓ Use Selected", font=("Segoe UI", 13, "bold"), fg_color=C["accent"], text_color="#000", hover_color=C["accent2"], command=apply_selection).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(btn_frame, text="Use Default", fg_color=C["ghost"], hover_color=C["ghost2"], command=use_default).pack(side="left")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Files view rendering
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _toggle_files_view_mode(self) -> None:
+        if self._files_view_mode == "list":
+            self._files_view_mode = "grid"
+            self._view_toggle_btn.configure(text="▦ Grid")
+        else:
+            self._files_view_mode = "list"
+            self._view_toggle_btn.configure(text="☰ List")
+        self._render_files_view()
+
+    def _refresh_files_view(self) -> None:
+        password = self.password_var.get()
+        if not password:
+            self._log("Enter the master password to view vault contents.")
+            return
+        vault_path = self._get_active_files_vault_path()
+        vault = PortableVault(vault_path)
+        if not vault.exists():
+            self._files_manifest = []
+            self._render_files_view()
+            self._update_files_status()
+            return
+        self._set_busy(True, "Loading vault contents...")
+        self._log(f"Scanning vault on {self._files_drive_var.get() if hasattr(self, '_files_drive_var') else 'drive'}…")
+
+        def scan_task() -> None:
+            staging = Path(tempfile.mkdtemp(prefix="shadowsync-scan-"))
+            try:
+                vault.restore_to(staging, password)
+                manifest = []
+                for item in sorted(staging.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+                    entry = {
+                        "name": item.name,
+                        "is_dir": item.is_dir(),
+                        "size": self._dir_size(item) if item.is_dir() else item.stat().st_size,
+                        "children": sum(1 for _ in item.rglob("*")) if item.is_dir() else 0,
+                    }
+                    if item.is_file():
+                        lower = item.name.lower()
+                        entry["is_app"] = lower.endswith((".appimage", ".exe", ".app"))
+                    else:
+                        entry["is_app"] = False
+                    manifest.append(entry)
+                self._files_manifest = manifest
+                self.log_queue.put(f"Vault scan complete: {len(manifest)} item(s) found.")
+            except ShadowSyncError as exc:
+                self.log_queue.put(f"Error scanning vault: {exc}")
+                self._files_manifest = []
+            finally:
+                wipe_directory(staging)
+                self.log_queue.put(("busy", False, ""))
+                self.after(0, self._render_files_view)
+                self.after(0, self._update_files_status)
+
+        threading.Thread(target=scan_task, daemon=True).start()
+
+    def _render_files_view(self) -> None:
+        scroll = self._files_scroll
+        for widget in scroll.winfo_children():
+            widget.destroy()
+
+        if not self._files_manifest:
+            C = self.C
+            ctk.CTkLabel(scroll, text="\n\n📭  Vault is empty\n\nAdd files or folders with the buttons above.\nThey will be encrypted and stored securely.", font=("Segoe UI", 13), text_color=C["muted"], justify="center").grid(row=0, column=0, sticky="nsew", pady=40)
+            return
+
+        if self._files_view_mode == "list":
+            self._render_list_view(scroll)
+        else:
+            self._render_grid_view(scroll)
+
+    def _render_list_view(self, parent) -> None:
+        C = self.C
+        header = ctk.CTkFrame(parent, fg_color=C["ghost"], corner_radius=6, height=32)
+        header.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 2))
+        header.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(header, text="  ", width=35, font=("Segoe UI", 11), text_color=C["muted"]).grid(row=0, column=0, padx=(10, 0), pady=6)
+        ctk.CTkLabel(header, text="Name", font=("Segoe UI", 11, "bold"), text_color=C["muted"], anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=6)
+        ctk.CTkLabel(header, text="Type", width=80, font=("Segoe UI", 11, "bold"), text_color=C["muted"]).grid(row=0, column=2, padx=5, pady=6)
+        ctk.CTkLabel(header, text="Size", width=80, font=("Segoe UI", 11, "bold"), text_color=C["muted"]).grid(row=0, column=3, padx=(5, 15), pady=6)
+
+        for idx, item in enumerate(self._files_manifest):
+            row_frame = ctk.CTkFrame(parent, fg_color=C["card"] if idx % 2 == 0 else C["sidebar"], corner_radius=6, height=38)
+            row_frame.grid(row=idx + 1, column=0, sticky="ew", padx=5, pady=1)
+            row_frame.grid_columnconfigure(1, weight=1)
+            if item["is_app"]:
+                icon, icon_color = "📦", C["purple"]
+            elif item["is_dir"]:
+                icon, icon_color = "📁", "#f59e0b"
+            else:
+                icon, icon_color = "📄", C["accent"]
+            ctk.CTkLabel(row_frame, text=icon, width=35, font=("Segoe UI", 14), text_color=icon_color).grid(row=0, column=0, padx=(10, 0), pady=8)
+            ctk.CTkLabel(row_frame, text=item["name"], font=("Segoe UI", 12), text_color=C["text"], anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=8)
+            if item["is_app"]:
+                type_text = "App"
+            elif item["is_dir"]:
+                type_text = f"Folder ({item['children']})"
+            else:
+                type_text = "File"
+            ctk.CTkLabel(row_frame, text=type_text, width=80, font=("Segoe UI", 11), text_color=C["muted"]).grid(row=0, column=2, padx=5, pady=8)
+            size_str = self._format_file_size(item["size"])
+            ctk.CTkLabel(row_frame, text=size_str, width=80, font=("Segoe UI", 11), text_color=C["muted"]).grid(row=0, column=3, padx=(5, 15), pady=8)
+
+    def _render_grid_view(self, parent) -> None:
+        C = self.C
+        cols = 4
+        for i in range(cols):
+            parent.grid_columnconfigure(i, weight=1)
+        for idx, item in enumerate(self._files_manifest):
+            row = idx // cols
+            col = idx % cols
+            card = ctk.CTkFrame(parent, fg_color=C["sidebar"], corner_radius=10, width=140, height=120)
+            card.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
+            card.grid_propagate(False)
+            card.grid_columnconfigure(0, weight=1)
+            if item["is_app"]:
+                icon, icon_color = "📦", C["purple"]
+            elif item["is_dir"]:
+                icon, icon_color = "📁", "#f59e0b"
+            else:
+                icon, icon_color = "📄", C["accent"]
+            ctk.CTkLabel(card, text=icon, font=("Segoe UI", 28), text_color=icon_color).grid(row=0, column=0, pady=(15, 5))
+            name = item["name"]
+            display_name = name if len(name) <= 16 else name[:14] + "…"
+            ctk.CTkLabel(card, text=display_name, font=("Segoe UI", 11), text_color=C["text"]).grid(row=1, column=0, padx=8)
+            size_str = self._format_file_size(item["size"])
+            ctk.CTkLabel(card, text=size_str, font=("Segoe UI", 10), text_color=C["muted"]).grid(row=2, column=0, pady=(0, 10))
+
+    def _update_files_status(self) -> None:
+        if self._files_status_label is None:
+            return
+        count = len(self._files_manifest)
+        vault_path = self._get_active_files_vault_path()
+        if vault_path.exists():
+            vault_size = self._format_file_size(vault_path.stat().st_size)
+            text = f"{count} item{'s' if count != 1 else ''}  •  Vault size: {vault_size}  •  Drive: {self._files_drive_var.get() if hasattr(self, '_files_drive_var') else '—'}"
+        elif count == 0:
+            text = "0 items  •  No vault on selected drive"
+        else:
+            text = f"{count} item{'s' if count != 1 else ''}  •  Vault file missing"
+        self._files_status_label.configure(text=text)
+
+    @staticmethod
+    def _format_file_size(size_bytes: int) -> str:
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+    @staticmethod
+    def _dir_size(path: Path) -> int:
+        total = 0
+        try:
+            for f in path.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except OSError:
+            pass
+        return total
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Stored Apps panel
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _refresh_stored_apps(self) -> None:
+        storage = self.storage_var.get().strip()
+        if not storage:
+            self._log("Choose the ShadowSync storage folder first.")
+            return
+        apps_root = Path(storage).expanduser().resolve() / "apps"
+        frame = self._stored_apps_frame
+        if frame is None:
+            return
+
+        for widget in frame.winfo_children():
+            widget.destroy()
+
+        if not apps_root.exists() or not any(apps_root.iterdir()):
+            C = self.C
+            ctk.CTkLabel(frame, text="No stored app vaults found. Launch an app with ShadowSync to create one.", text_color=C["muted"], font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+            return
+
+        C = self.C
+        row_idx = 0
+        for app_dir in sorted(apps_root.iterdir()):
+            if not app_dir.is_dir():
+                continue
+            app_name = display_app_name(app_dir.name)
+            profiles_dir = app_dir / "profiles"
+            profile_count = 0
+            total_size = 0
+            if profiles_dir.exists():
+                for profile_dir in profiles_dir.iterdir():
+                    if profile_dir.is_dir():
+                        profile_count += 1
+                        vault_file = profile_dir / "profile.ssvault"
+                        if vault_file.exists():
+                            total_size += vault_file.stat().st_size
+
+            row = ctk.CTkFrame(frame, fg_color=C["sidebar"] if row_idx % 2 == 0 else C["card"], corner_radius=6, height=40)
+            row.grid(row=row_idx, column=0, sticky="ew", padx=2, pady=2)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(row, text="📦", font=("Segoe UI", 14), text_color=C["purple"]).grid(row=0, column=0, padx=(10, 5), pady=8)
+            ctk.CTkLabel(row, text=app_name, font=("Segoe UI", 12, "bold"), text_color=C["text"], anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=8)
+            ctk.CTkLabel(row, text=f"{profile_count} profile{'s' if profile_count != 1 else ''}", font=("Segoe UI", 11), text_color=C["muted"], width=90).grid(row=0, column=2, padx=5, pady=8)
+            ctk.CTkLabel(row, text=self._format_file_size(total_size), font=("Segoe UI", 11), text_color=C["muted"], width=70).grid(row=0, column=3, padx=(5, 10), pady=8)
+
+            safe_name = app_dir.name
+            row.bind("<Button-1>", lambda e, n=app_name, s=safe_name: self._select_stored_app(n, s))
+            for child in row.winfo_children():
+                child.bind("<Button-1>", lambda e, n=app_name, s=safe_name: self._select_stored_app(n, s))
+
+            row_idx += 1
+
+        self._log(f"Found {row_idx} stored app vault(s).")
+
+    def _select_stored_app(self, display_name: str, safe_name: str) -> None:
+        self.app_name_var.set(display_name)
+        self.profile_kind_var.set("Custom")
+        guessed = guess_profile_path(display_name)
+        self.profile_var.set(guessed)
+        self._refresh_profile_names()
+        self._log(f"Selected stored app: {display_name}. Set the executable and password to launch.")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     if AESGCM is None:

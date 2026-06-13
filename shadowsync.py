@@ -2779,8 +2779,17 @@ class ShadowSyncApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
+        # Set up password variable first
+        self.password_var = ctk.StringVar()
+        self.password_var.trace_add("write", lambda *_args: self._clear_executable_approval())
+
         self._build_sidebar()
         self._build_main_panel()
+        self._build_lock_screen()
+
+        # Hide main UI initially
+        self.sidebar.grid_remove()
+        self.tabview.grid_remove()
 
         self.after(150, self._drain_log)
         self.after(500, self._start_storage_scan)
@@ -2794,11 +2803,11 @@ class ShadowSyncApp(ctk.CTk):
 
     def _build_sidebar(self) -> None:
         C = self.C
-        sidebar = ctk.CTkFrame(self, fg_color=C["sidebar"], width=280, corner_radius=0)
-        sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar = ctk.CTkFrame(self, fg_color=C["sidebar"], width=280, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_columnconfigure(0, weight=1)
 
-        logo_f = ctk.CTkFrame(sidebar, fg_color="transparent")
+        logo_f = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         logo_f.grid(row=0, column=0, pady=(32, 20), padx=20, sticky="ew")
         ctk.CTkLabel(logo_f, text="🔐", font=("Segoe UI", 28), text_color=C["accent"]).pack(side="left", padx=(0, 10))
         text_f = ctk.CTkFrame(logo_f, fg_color="transparent")
@@ -2806,25 +2815,79 @@ class ShadowSyncApp(ctk.CTk):
         ctk.CTkLabel(text_f, text="ShadowSync", font=("Segoe UI", 18, "bold"), text_color=C["accent"], anchor="w").pack(fill="x")
         ctk.CTkLabel(text_f, text="Zero-Trust Persistence v2", font=("Segoe UI", 10), text_color=C["muted"], anchor="w").pack(fill="x")
 
-        ctk.CTkFrame(sidebar, fg_color=C["ghost"], height=2).grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+        ctk.CTkFrame(self.sidebar, fg_color=C["ghost"], height=2).grid(row=1, column=0, sticky="ew", padx=20, pady=10)
 
-        self.status_frame = ctk.CTkFrame(sidebar, fg_color=C["ghost"], corner_radius=8)
+        self.status_frame = ctk.CTkFrame(self.sidebar, fg_color=C["ghost"], corner_radius=8)
         self.status_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=10)
         self._status_dot = ctk.CTkLabel(self.status_frame, text="●", font=("Segoe UI", 16), text_color=C["lock_blue"])
         self._status_dot.pack(side="left", padx=(15, 10), pady=12)
         self.state_label = ctk.CTkLabel(self.status_frame, text="Locked", font=("Segoe UI", 13, "bold"), text_color=C["lock_blue"])
         self.state_label.pack(side="left", pady=12)
 
-        self.heartbeat_dot = ctk.CTkLabel(sidebar, text="● Heartbeat idle", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
+        self.heartbeat_dot = ctk.CTkLabel(self.sidebar, text="● Heartbeat idle", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
         self.heartbeat_dot.grid(row=4, column=0, sticky="ew", padx=28, pady=(0, 10))
 
         # Drive info
-        self._drive_label = ctk.CTkLabel(sidebar, text="💾 Drive: —", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
+        self._drive_label = ctk.CTkLabel(self.sidebar, text="💾 Drive: —", font=("Segoe UI", 11), text_color=C["muted"], anchor="w")
         self._drive_label.grid(row=5, column=0, sticky="ew", padx=28, pady=(0, 10))
 
-        panic_btn = ctk.CTkButton(sidebar, text="⚠️ PANIC WIPE", fg_color=C["danger"], hover_color=C["danger2"],
+        panic_btn = ctk.CTkButton(self.sidebar, text="⚠️ PANIC WIPE", fg_color=C["danger"], hover_color=C["danger2"],
                                   font=("Segoe UI", 12, "bold"), corner_radius=6, command=self._panic)
         panic_btn.grid(row=6, column=0, sticky="ew", padx=20, pady=(10, 0))
+
+        lock_app_btn = ctk.CTkButton(self.sidebar, text="🔒 LOCK APP", fg_color=C["ghost"], hover_color=C["ghost2"],
+                                     font=("Segoe UI", 12, "bold"), corner_radius=6, command=self._lock)
+        lock_app_btn.grid(row=7, column=0, sticky="ew", padx=20, pady=(10, 0))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lock Screen
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_lock_screen(self) -> None:
+        C = self.C
+        self.lock_screen = ctk.CTkFrame(self, fg_color=C["bg"])
+        self.lock_screen.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self.lock_screen.grid_columnconfigure(0, weight=1)
+        self.lock_screen.grid_rowconfigure(0, weight=1)
+
+        center_f = ctk.CTkFrame(self.lock_screen, fg_color="transparent")
+        center_f.grid(row=0, column=0)
+
+        ctk.CTkLabel(center_f, text="🔐", font=("Segoe UI", 80), text_color=C["accent"]).pack(pady=(0, 20))
+        ctk.CTkLabel(center_f, text="ShadowSync", font=("Segoe UI", 32, "bold"), text_color=C["accent"]).pack(pady=(0, 5))
+        ctk.CTkLabel(center_f, text="Enter master password to unlock session", font=("Segoe UI", 14), text_color=C["muted"]).pack(pady=(0, 30))
+
+        pw_f = ctk.CTkFrame(center_f, fg_color="transparent")
+        pw_f.pack(pady=(0, 20))
+
+        self._master_pw_entry = ctk.CTkEntry(pw_f, show="●", width=250, height=45, font=("Segoe UI", 16), fg_color=C["input_bg"], border_color=C["ghost"])
+        self._master_pw_entry.pack(side="left", padx=(0, 10))
+        self._master_pw_entry.bind("<Return>", lambda e: self._unlock())
+
+        self._pw_eye_btn = ctk.CTkButton(pw_f, text="👁", width=40, height=45, fg_color=C["ghost"], hover_color=C["ghost2"], command=self._toggle_password_visibility)
+        self._pw_eye_btn.pack(side="left")
+
+        ctk.CTkButton(center_f, text="Unlock ShadowSync", width=300, height=45, font=("Segoe UI", 16, "bold"), fg_color=C["accent"], text_color="#000", hover_color=C["accent2"], command=self._unlock).pack()
+
+    def _unlock(self) -> None:
+        pw = self._master_pw_entry.get()
+        if not pw:
+            return
+        self.password_var.set(pw)
+        self.lock_screen.grid_remove()
+        self.sidebar.grid()
+        self.tabview.grid()
+        self.state_label.configure(text="Unlocked 🔓", text_color=self.C["run_green"])
+        self._status_dot.configure(text_color=self.C["run_green"])
+
+    def _lock(self) -> None:
+        self.password_var.set("")
+        self._master_pw_entry.delete(0, 'end')
+        self.sidebar.grid_remove()
+        self.tabview.grid_remove()
+        self.lock_screen.grid()
+        self.state_label.configure(text="Locked 🔒", text_color=self.C["lock_blue"])
+        self._status_dot.configure(text_color=self.C["lock_blue"])
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main panel / tabs
@@ -2880,8 +2943,6 @@ class ShadowSyncApp(ctk.CTk):
         self.profile_var = ctk.StringVar(value=self.presets.get("Session", ""))
         self.exec_var = ctk.StringVar()
         self.wipe_var = ctk.BooleanVar(value=True)
-        self.password_var = ctk.StringVar()
-        self.password_var.trace_add("write", lambda *_args: self._clear_executable_approval())
 
         self._vault_field(card, 1, "STORAGE FOLDER", self.storage_var, self._browse_storage)
         self._vault_field(card, 2, "APP NAME", self.app_name_var, None)
@@ -2899,15 +2960,6 @@ class ShadowSyncApp(ctk.CTk):
         ctk.CTkLabel(card, text="PRESET", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=6, column=0, sticky="w", padx=(20, 10), pady=10)
         preset = ctk.CTkComboBox(card, variable=self.profile_kind_var, values=list(self.presets), fg_color=C["input_bg"], border_color=C["ghost"], button_color=C["ghost"], command=self._preset_changed)
         preset.grid(row=6, column=1, sticky="ew", pady=10, padx=(0, 20))
-
-        ctk.CTkLabel(card, text="MASTER PASSWORD", font=("Segoe UI", 11, "bold"), text_color=C["label"]).grid(row=7, column=0, sticky="w", padx=(20, 10), pady=10)
-        pw_f = ctk.CTkFrame(card, fg_color="transparent")
-        pw_f.grid(row=7, column=1, sticky="ew", pady=10, padx=(0, 20))
-        pw_f.grid_columnconfigure(0, weight=1)
-        self._pw_entry = ctk.CTkEntry(pw_f, textvariable=self.password_var, show="●", fg_color=C["input_bg"], border_color=C["ghost"])
-        self._pw_entry.grid(row=0, column=0, sticky="ew")
-        self._pw_eye_btn = ctk.CTkButton(pw_f, text="👁", width=40, fg_color=C["ghost"], hover_color=C["ghost2"], command=self._toggle_password_visibility)
-        self._pw_eye_btn.grid(row=0, column=1, padx=(10, 0))
 
         ctk.CTkCheckBox(card, text="Wipe profile after close", variable=self.wipe_var, text_color=C["text"], fg_color=C["accent"]).grid(row=8, column=1, sticky="w", pady=(10, 20))
 
@@ -3542,7 +3594,7 @@ class ShadowSyncApp(ctk.CTk):
 
     def _toggle_password_visibility(self) -> None:
         self._pw_visible = not self._pw_visible
-        self._pw_entry.configure(show="" if self._pw_visible else "●")
+        self._master_pw_entry.configure(show="" if self._pw_visible else "●")
         self._pw_eye_btn.configure(text_color=self.C["accent"] if self._pw_visible else self.C["label"])
 
     def _h_browse_wallpaper(self) -> None:

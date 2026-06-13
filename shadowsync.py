@@ -196,13 +196,12 @@ class PortableVault:
             self._safe_extract_no_overwrite(archive, destination)
 
     def save_from(self, source: Path, password: str) -> None:
-        if not source.exists():
-            raise ShadowSyncError(f"Profile folder does not exist: {source}")
         zip_bytes = io.BytesIO()
         with zipfile.ZipFile(zip_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(source.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(source).as_posix())
+            if source.exists():
+                for path in sorted(source.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(source).as_posix())
         encrypted = self._encrypt(zip_bytes.getvalue(), password)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -959,6 +958,26 @@ class OSSettingsWorker:
             return self._capture_wifi_linux()
         return []
 
+    @staticmethod
+    def _is_root() -> bool:
+        """Return True if running as root/admin."""
+        try:
+            return os.getuid() == 0
+        except AttributeError:
+            return False  # Windows
+
+    @staticmethod
+    def _sudo_prefix() -> List[str]:
+        """Return sudo prefix when not root, for subprocess calls."""
+        if OSSettingsWorker._is_root():
+            return []
+        # Prefer pkexec for GUI contexts, fall back to sudo
+        if shutil.which("pkexec"):
+            return ["pkexec"]
+        if shutil.which("sudo"):
+            return ["sudo", "-n"]  # -n = non-interactive (fail if needs password)
+        return []
+
     def _capture_wifi_windows(self) -> List[WifiProfile]:
         profiles: List[WifiProfile] = []
         # List profiles
@@ -1009,34 +1028,111 @@ class OSSettingsWorker:
 
     def _capture_wifi_linux(self) -> List[WifiProfile]:
         profiles: List[WifiProfile] = []
-        # List connections
+        # List connections via nmcli
         result = subprocess.run(
             ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
             capture_output=True, text=True, check=False,
         )
         if result.returncode != 0:
-            self._log("WiFi capture: nmcli not available.")
-            return profiles
+            self._log("WiFi capture: nmcli not available — trying iw/iwconfig fallback.")
+            return self._capture_wifi_linux_fallback()
 
         wifi_names = []
         for line in result.stdout.splitlines():
             parts = line.split(":")
             if len(parts) >= 2 and "wireless" in parts[1].lower():
-                wifi_names.append(parts[0])
+                wifi_names.append(parts[0].strip())
 
-        nm_dir = Path("/etc/NetworkManager/system-connections")
+        if not wifi_names:
+            self._log("WiFi capture: no wireless connections found in nmcli.")
+            return profiles
+
+        # Search multiple NM connection directories (Tails may use /run/NetworkManager)
+        nm_dirs = [
+            Path("/etc/NetworkManager/system-connections"),
+            Path("/run/NetworkManager/system-connections"),
+            Path("/var/run/NetworkManager/system-connections"),
+        ]
+
         for name in wifi_names:
-            # Try to read the nmconnection file
-            conn_file = nm_dir / f"{name}.nmconnection"
             blob = ""
-            if conn_file.exists():
+            auth_type = ""
+
+            # 1) Try nmcli connection export (best: works even without root for some)
+            export_result = subprocess.run(
+                ["nmcli", "--show-secrets", "connection", "export", name],
+                capture_output=True, check=False,
+            )
+            if export_result.returncode == 0 and export_result.stdout:
+                blob = base64.b64encode(export_result.stdout).decode("ascii")
+                self._log(f"WiFi captured via nmcli export: {name}")
+            else:
+                # 2) Try reading the .nmconnection file directly (may need root)
+                for nm_dir in nm_dirs:
+                    conn_file = nm_dir / f"{name}.nmconnection"
+                    if not conn_file.exists():
+                        # also try without spaces
+                        conn_file = nm_dir / f"{name.replace(' ', '_')}.nmconnection"
+                    if conn_file.exists():
+                        try:
+                            raw = conn_file.read_bytes()
+                            blob = base64.b64encode(raw).decode("ascii")
+                            self._log(f"WiFi captured from file: {conn_file}")
+                            break
+                        except (OSError, PermissionError):
+                            # 3) Try with sudo
+                            sudo = self._sudo_prefix()
+                            if sudo:
+                                r2 = subprocess.run(
+                                    sudo + ["cat", str(conn_file)],
+                                    capture_output=True, check=False,
+                                )
+                                if r2.returncode == 0 and r2.stdout:
+                                    blob = base64.b64encode(r2.stdout).decode("ascii")
+                                    self._log(f"WiFi captured via sudo: {name}")
+                                    break
+                            self._log(f"WiFi capture: cannot read {conn_file} (need root).")
+
+            # Extract password hint from blob if it's a .nmconnection (ini format)
+            password_hint = ""
+            if blob:
                 try:
-                    raw = conn_file.read_bytes()
-                    blob = base64.b64encode(raw).decode("ascii")
-                except (OSError, PermissionError):
-                    self._log(f"WiFi capture: cannot read {conn_file} (need root?)")
-            profiles.append(WifiProfile(ssid=name, blob=blob))
-            self._log(f"WiFi captured: {name}")
+                    raw_str = base64.b64decode(blob).decode("utf-8", errors="ignore")
+                    # Look for psk= in [wifi-security] section
+                    psk_match = re.search(r"^psk=(.+)$", raw_str, re.MULTILINE)
+                    if psk_match:
+                        password_hint = psk_match.group(1).strip()
+                    # Extract auth type
+                    key_mgmt_match = re.search(r"^key-mgmt=(.+)$", raw_str, re.MULTILINE)
+                    if key_mgmt_match:
+                        auth_type = key_mgmt_match.group(1).strip()
+                except Exception:
+                    pass
+
+            profiles.append(WifiProfile(
+                ssid=name,
+                blob=blob,
+                auth_type=auth_type,
+                password_hint=password_hint,
+            ))
+            if not blob:
+                self._log(f"WiFi captured (no blob/needs root for full export): {name}")
+        return profiles
+
+    def _capture_wifi_linux_fallback(self) -> List[WifiProfile]:
+        """Fallback WiFi capture when nmcli is unavailable."""
+        profiles: List[WifiProfile] = []
+        # Try iwconfig to find current SSID
+        for tool in ("iwgetid", "iw"):
+            if not shutil.which(tool):
+                continue
+            if tool == "iwgetid":
+                r = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, check=False)
+                if r.returncode == 0 and r.stdout.strip():
+                    ssid = r.stdout.strip()
+                    profiles.append(WifiProfile(ssid=ssid))
+                    self._log(f"WiFi fallback (iwgetid): found current SSID {ssid}")
+            break
         return profiles
 
     # ------------------------------------------------------------------
@@ -1077,37 +1173,96 @@ class OSSettingsWorker:
 
     def _restore_wifi_linux(self, profiles: List[WifiProfile]) -> None:
         nm_dir = Path("/etc/NetworkManager/system-connections")
-        reloaded = False
+        sudo = self._sudo_prefix()
+        needs_reload = False
+        activated_ssids: List[str] = []
+
         for profile in profiles:
             if not profile.blob:
-                # Fallback: nmcli connect
-                if profile.password_hint:
-                    subprocess.run(
-                        ["nmcli", "dev", "wifi", "connect", profile.ssid,
-                         "password", profile.password_hint],
-                        capture_output=True, check=False, timeout=15,
+                # Fallback: nmcli connect with stored password
+                if profile.password_hint and profile.ssid:
+                    cmd = ["nmcli", "dev", "wifi", "connect", profile.ssid,
+                           "password", profile.password_hint]
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, check=False, timeout=20,
                     )
+                    if result.returncode == 0:
+                        self._log(f"WiFi connected: {profile.ssid}")
+                    else:
+                        self._log(f"WiFi connect failed for {profile.ssid}: {result.stderr.strip()}")
                 continue
+
             raw = base64.b64decode(profile.blob)
             conn_file = nm_dir / f"{profile.ssid}.nmconnection"
+            written = False
+
+            # Try direct write first
             try:
                 nm_dir.mkdir(parents=True, exist_ok=True)
                 conn_file.write_bytes(raw)
                 conn_file.chmod(0o600)
-                reloaded = False  # mark need reload
+                written = True
                 self._log(f"WiFi profile written: {profile.ssid}")
-            except (OSError, PermissionError) as e:
-                self._log(f"WiFi restore: cannot write {conn_file}: {e}")
+            except (OSError, PermissionError):
+                # Try with sudo
+                if sudo:
+                    try:
+                        import tempfile as _tmpmod
+                        with _tmpmod.NamedTemporaryFile(delete=False, suffix=".nmconnection") as tf:
+                            tf.write(raw)
+                            tf_path = tf.name
+                        r_cp = subprocess.run(
+                            sudo + ["cp", tf_path, str(conn_file)],
+                            capture_output=True, check=False,
+                        )
+                        subprocess.run(
+                            sudo + ["chmod", "600", str(conn_file)],
+                            capture_output=True, check=False,
+                        )
+                        os.unlink(tf_path)
+                        if r_cp.returncode == 0:
+                            written = True
+                            self._log(f"WiFi profile written (sudo): {profile.ssid}")
+                        else:
+                            self._log(f"WiFi restore: sudo copy failed for {profile.ssid}")
+                    except Exception as e:
+                        self._log(f"WiFi restore: sudo fallback failed for {profile.ssid}: {e}")
+                else:
+                    self._log(f"WiFi restore: cannot write {conn_file} (need root)")
 
-        if reloaded is False:
+            if written:
+                needs_reload = True
+                activated_ssids.append(profile.ssid)
+
+        # Reload NetworkManager after writing profiles
+        if needs_reload:
+            reload_cmd = sudo + ["nmcli", "connection", "reload"] if sudo else ["nmcli", "connection", "reload"]
             r = subprocess.run(
-                ["nmcli", "connection", "reload"],
-                capture_output=True, text=True, check=False,
+                reload_cmd, capture_output=True, text=True, check=False,
             )
             if r.returncode == 0:
                 self._log("NetworkManager connections reloaded.")
             else:
                 self._log(f"nmcli reload failed: {r.stderr.strip()}")
+
+            # Activate each written connection
+            for ssid in activated_ssids:
+                up_result = subprocess.run(
+                    ["nmcli", "connection", "up", ssid],
+                    capture_output=True, text=True, check=False, timeout=20,
+                )
+                if up_result.returncode == 0:
+                    self._log(f"WiFi activated: {ssid}")
+                else:
+                    self._log(f"WiFi activate failed for {ssid}: {up_result.stderr.strip()} — trying dev wifi connect")
+                    # Last resort: nmcli dev wifi connect
+                    for wp in profiles:
+                        if wp.ssid == ssid and wp.password_hint:
+                            subprocess.run(
+                                ["nmcli", "dev", "wifi", "connect", ssid, "password", wp.password_hint],
+                                capture_output=True, check=False, timeout=20,
+                            )
+                            break
 
     # ------------------------------------------------------------------
     # Wallpaper
@@ -1124,13 +1279,41 @@ class OSSettingsWorker:
             except Exception:
                 return ""
         if _IS_LINUX:
-            r = subprocess.run(
-                ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
+            # Try gsettings with explicit DBUS address
+            env = self._gnome_env()
+            if env:
+                r = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
+                    capture_output=True, text=True, check=False, env=env,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip().strip("'\"")
+            # Try xfconf (XFCE)
+            r2 = subprocess.run(
+                ["xfconf-query", "-c", "xfce4-desktop", "-p", "/backdrop/screen0/monitor0/workspace0/last-image"],
                 capture_output=True, text=True, check=False,
             )
-            if r.returncode == 0:
-                return r.stdout.strip().strip("'\"")
+            if r2.returncode == 0 and r2.stdout.strip():
+                return r2.stdout.strip()
         return ""
+
+    @staticmethod
+    def _gnome_env() -> Optional[dict]:
+        """Build env dict with correct DBUS_SESSION_BUS_ADDRESS for gsettings."""
+        env = dict(os.environ)
+        if "DBUS_SESSION_BUS_ADDRESS" in env:
+            return env  # already set
+        # Try to find the session bus for the current user
+        try:
+            import glob as _glob
+            pattern = "/run/user/*/bus"
+            buses = _glob.glob(pattern)
+            if buses:
+                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={buses[0]}"
+                return env
+        except Exception:
+            pass
+        return None
 
     def _restore_wallpaper(self, path: str) -> None:
         if _IS_WINDOWS:
@@ -1142,10 +1325,12 @@ class OSSettingsWorker:
                 self._log(f"Wallpaper restore failed: {e}")
         elif _IS_LINUX:
             uri = path if path.startswith("file://") else f"file://{path}"
+            env = self._gnome_env()
             for key in ("picture-uri", "picture-uri-dark"):
                 subprocess.run(
                     ["gsettings", "set", "org.gnome.desktop.background", key, uri],
                     capture_output=True, check=False,
+                    **(dict(env=env) if env else {}),
                 )
             self._log(f"Wallpaper restored: {uri}")
 
@@ -1155,13 +1340,24 @@ class OSSettingsWorker:
 
     def _capture_theme(self) -> str:
         if _IS_LINUX:
-            r = subprocess.run(
-                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            env = self._gnome_env()
+            if env:
+                r = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                    capture_output=True, text=True, check=False, env=env,
+                )
+                if r.returncode == 0 and "dark" in r.stdout.lower():
+                    return "dark"
+                if r.returncode == 0:
+                    return "light"
+            # Fallback: dconf
+            r2 = subprocess.run(
+                ["dconf", "read", "/org/gnome/desktop/interface/color-scheme"],
                 capture_output=True, text=True, check=False,
             )
-            if r.returncode == 0 and "dark" in r.stdout.lower():
+            if r2.returncode == 0 and "dark" in r2.stdout.lower():
                 return "dark"
-            return "light"
+            return "dark"  # Tails default
         if _IS_WINDOWS:
             try:
                 import winreg
@@ -1178,9 +1374,11 @@ class OSSettingsWorker:
     def _restore_theme(self, theme: str) -> None:
         if _IS_LINUX:
             scheme = "prefer-dark" if theme == "dark" else "default"
+            env = self._gnome_env()
             subprocess.run(
                 ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", scheme],
                 capture_output=True, check=False,
+                **(dict(env=env) if env else {}),
             )
             self._log(f"Theme restored: {scheme}")
         elif _IS_WINDOWS:
@@ -1325,9 +1523,28 @@ class OSSettingsWorker:
     def _capture_installed_apps(self) -> List[str]:
         apps: List[str] = []
         if _IS_LINUX:
+            # dpkg --get-selections (standard Debian/Tails)
             apps.extend(self._run_lines(["dpkg", "--get-selections"], prefix="dpkg"))
-            apps.extend(self._run_lines(["flatpak", "list", "--app", "--columns=name"], prefix="flatpak"))
-            apps.extend(self._run_lines(["snap", "list"], prefix="snap", skip_header=True))
+            # apt list --installed (better on modern Debian/Tails)
+            if not apps and shutil.which("apt"):
+                try:
+                    r = subprocess.run(
+                        ["apt", "list", "--installed"],
+                        capture_output=True, text=True, check=False, timeout=30,
+                        env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+                    )
+                    if r.returncode == 0:
+                        for line in r.stdout.splitlines():
+                            if line and not line.startswith("Listing") and "/" in line:
+                                pkg_name = line.split("/")[0].strip()
+                                if pkg_name:
+                                    apps.append(f"apt:{pkg_name}")
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+            if shutil.which("flatpak"):
+                apps.extend(self._run_lines(["flatpak", "list", "--app", "--columns=name"], prefix="flatpak"))
+            if shutil.which("snap"):
+                apps.extend(self._run_lines(["snap", "list"], prefix="snap", skip_header=True))
         elif _IS_WINDOWS:
             # winget (if available)
             r = subprocess.run(
@@ -1539,18 +1756,33 @@ class HydrateWorker:
         Hydrate WiFi for Tails/Linux.
 
         Strategy:
-        1. If the OS Settings vault has been captured and saved (recommended), the
-           HydrateConfig.wifi_profiles list carries plaintext SSID+password tuples
-           as a quick-connect fallback.  The *full* profile blobs (nmconnection
-           files) are stored in OSSettings and applied by OSSettingsWorker — use
-           the OS State tab for that.
-        2. Here we write each nmconnection blob (if stored in the simple profile
-           dict as a 'blob' key) into NetworkManager, then fall back to nmcli
-           connect with the plaintext password — so Tails users never have to
-           type the password again after hydrating from the vault.
+        1. If a full nmconnection blob is stored in the profile dict ('blob' key),
+           write it to /etc/NetworkManager/system-connections/, reload NM, and
+           activate the connection — so Tails users never re-type WiFi passwords.
+        2. Otherwise fall back to nmcli connect with the stored plaintext password.
+        3. Uses sudo/pkexec automatically when not running as root.
         """
+        if not _IS_LINUX:
+            self._log("Hydrate: WiFi hydration is Linux/Tails only.")
+            return
+
         nm_dir = Path("/etc/NetworkManager/system-connections")
-        reloaded = False
+        # Determine if we need sudo
+        is_root = False
+        try:
+            is_root = os.getuid() == 0
+        except AttributeError:
+            pass
+        sudo: List[str] = []
+        if not is_root:
+            if shutil.which("sudo"):
+                sudo = ["sudo", "-n"]
+            elif shutil.which("pkexec"):
+                sudo = ["pkexec"]
+
+        written_ssids: List[str] = []
+        failed_ssids: List[tuple] = []  # (ssid, password)
+
         for idx, profile in enumerate(self.config.wifi_profiles, start=1):
             ssid = str(profile.get("ssid", "")).strip()
             pwd = str(profile.get("password", "")).strip()
@@ -1559,50 +1791,104 @@ class HydrateWorker:
                 continue
             self._log(f"Hydrate: applying Wi-Fi profile {idx} ({ssid})…")
 
-            # ── Path A: write full nmconnection blob (Tails preferred) ──
-            if blob and _IS_LINUX:
+            # ── Path A: write full nmconnection blob (preferred, works without password prompt) ──
+            if blob:
+                raw = base64.b64decode(blob)
+                conn_file = nm_dir / f"{ssid}.nmconnection"
+                blob_written = False
+
+                # Try direct write first
                 try:
                     nm_dir.mkdir(parents=True, exist_ok=True)
-                    conn_file = nm_dir / f"{ssid}.nmconnection"
-                    conn_file.write_bytes(base64.b64decode(blob))
+                    conn_file.write_bytes(raw)
                     conn_file.chmod(0o600)
-                    reloaded = False
+                    blob_written = True
                     self._log(f"Hydrate: wrote nmconnection for {ssid}.")
-                except Exception as e:
-                    self._log(f"Hydrate: blob write failed for {ssid}: {e} — falling back to connect.")
-                    blob = ""  # fall through to nmcli connect
+                except (OSError, PermissionError):
+                    # Try with sudo
+                    if sudo:
+                        import tempfile as _tmpmod
+                        try:
+                            with _tmpmod.NamedTemporaryFile(delete=False, suffix=".nmconnection") as tf:
+                                tf.write(raw)
+                                tf_path = tf.name
+                            r_cp = subprocess.run(
+                                sudo + ["cp", tf_path, str(conn_file)],
+                                capture_output=True, check=False,
+                            )
+                            subprocess.run(
+                                sudo + ["chmod", "600", str(conn_file)],
+                                capture_output=True, check=False,
+                            )
+                            subprocess.run(
+                                sudo + ["chown", "root:root", str(conn_file)],
+                                capture_output=True, check=False,
+                            )
+                            os.unlink(tf_path)
+                            if r_cp.returncode == 0:
+                                blob_written = True
+                                self._log(f"Hydrate: wrote nmconnection (sudo) for {ssid}.")
+                            else:
+                                self._log(f"Hydrate: sudo cp failed for {ssid} — will try nmcli connect.")
+                        except Exception as e:
+                            self._log(f"Hydrate: sudo blob write error for {ssid}: {e}")
+                    else:
+                        self._log(f"Hydrate: cannot write nmconnection for {ssid} (not root, no sudo). Falling back to nmcli connect.")
 
-            # ── Path B: nmcli connect with stored password ──
-            if not blob:
-                try:
-                    cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-                    if pwd:
-                        cmd += ["password", pwd]
-                    result = subprocess.run(
-                        cmd, check=False,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                        timeout=20,
-                    )
-                    if result.returncode == 0:
-                        self._log(f"Hydrate: Wi-Fi connected to {ssid}.")
-                        return
-                    self._log(f"Hydrate: connect failed for {ssid}: {result.stderr.strip()}")
-                except FileNotFoundError:
-                    self._log("Hydrate: nmcli not found — skipping Wi-Fi.")
-                    return
-                except subprocess.TimeoutExpired:
-                    self._log(f"Hydrate: Wi-Fi profile {idx} timed out.")
+                if blob_written:
+                    written_ssids.append(ssid)
+                    continue  # Will be activated after reload
+                # If blob write failed, fall through to nmcli connect
+                failed_ssids.append((ssid, pwd))
+            else:
+                failed_ssids.append((ssid, pwd))
 
-        # Reload NM after writing any blobs
-        if not reloaded and _IS_LINUX:
-            r = subprocess.run(
-                ["nmcli", "connection", "reload"],
-                capture_output=True, text=True, check=False,
-            )
+        # ── Reload NM after writing blobs ──
+        if written_ssids:
+            reload_cmd = (sudo + ["nmcli", "connection", "reload"]) if sudo else ["nmcli", "connection", "reload"]
+            r = subprocess.run(reload_cmd, capture_output=True, text=True, check=False)
             if r.returncode == 0:
                 self._log("Hydrate: NetworkManager reloaded with new profiles.")
             else:
-                self._log(f"Hydrate: nmcli reload: {r.stderr.strip()}") 
+                self._log(f"Hydrate: nmcli reload: {r.stderr.strip()}")
+
+            # Activate each written profile
+            for ssid in written_ssids:
+                up_result = subprocess.run(
+                    ["nmcli", "connection", "up", ssid],
+                    capture_output=True, text=True, check=False, timeout=25,
+                )
+                if up_result.returncode == 0:
+                    self._log(f"Hydrate: Wi-Fi activated → {ssid}")
+                else:
+                    self._log(f"Hydrate: activation failed for {ssid}: {up_result.stderr.strip()}")
+                    # Try connecting to the AP directly as last resort
+                    # Find stored password for this ssid
+                    for p in self.config.wifi_profiles:
+                        if str(p.get("ssid", "")).strip() == ssid and str(p.get("password", "")).strip():
+                            failed_ssids.append((ssid, str(p.get("password", "")).strip()))
+                            break
+
+        # ── Path B: nmcli connect for profiles without a blob ──
+        for ssid, pwd in failed_ssids:
+            try:
+                cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+                if pwd:
+                    cmd += ["password", pwd]
+                result = subprocess.run(
+                    cmd, check=False,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    timeout=25,
+                )
+                if result.returncode == 0:
+                    self._log(f"Hydrate: Wi-Fi connected to {ssid}.")
+                else:
+                    self._log(f"Hydrate: connect failed for {ssid}: {result.stderr.strip()}")
+            except FileNotFoundError:
+                self._log("Hydrate: nmcli not found — cannot connect to Wi-Fi.")
+                break
+            except subprocess.TimeoutExpired:
+                self._log(f"Hydrate: Wi-Fi connect timed out for {ssid}.")
 
     def _log(self, message: str) -> None:
         self.log.put(message)
@@ -3463,9 +3749,37 @@ class ShadowSyncApp(ctk.CTk):
 
     def _import_manual_items(self, sources: list[Path], password: str) -> None:
         vault_path = self._get_active_files_vault_path()
-        vault_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check that the target drive/directory is writable before starting
+        vault_dir = vault_path.parent
+        try:
+            vault_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as exc:
+            drive = self._files_drive_var.get() if hasattr(self, "_files_drive_var") else str(vault_dir)
+            messagebox.showerror(
+                "Files Vault — Write Error",
+                f"Cannot create vault directory on drive:\n{vault_dir}\n\n"
+                f"Error: {exc}\n\n"
+                "The drive may be read-only or unmounted. On Tails, check that the USB drive "
+                "is mounted with write access (right-click → Mount in Files Manager).",
+            )
+            return
+
+        if not os.access(str(vault_dir), os.W_OK):
+            drive = self._files_drive_var.get() if hasattr(self, "_files_drive_var") else str(vault_dir)
+            messagebox.showerror(
+                "Files Vault — Read-Only Drive",
+                f"The selected drive is read-only:\n{drive}\n\n"
+                "Cannot save encrypted files to a read-only drive.\n\n"
+                "On Tails:\n"
+                "• Use a USB drive mounted with write access\n"
+                "• Or change the TARGET DRIVE to your home folder (~)",
+            )
+            return
+
         vault = PortableVault(vault_path)
         self._set_busy(True, "Encrypting manual files vault...")
+        self._log(f"Saving vault to: {vault_path}")
 
         def import_task() -> None:
             staging = Path(tempfile.mkdtemp(prefix="shadowsync-files-"))
@@ -3482,6 +3796,7 @@ class ShadowSyncApp(ctk.CTk):
                     vault_size = vault_path.stat().st_size
                     size_str = self._format_file_size(vault_size)
                     self.log_queue.put(f"Added {len(sources)} item(s) to drive vault: {', '.join(added_names)}  [vault size: {size_str}]")
+                    self.log_queue.put(f"Vault saved at: {vault_path}")
                 else:
                     self.log_queue.put(f"Warning: vault file not found after save at {vault_path}")
                 self.after(100, self._refresh_files_view)
@@ -3498,7 +3813,9 @@ class ShadowSyncApp(ctk.CTk):
                 wipe_directory(staging)
                 self.log_queue.put(("busy", False, ""))
 
+
         threading.Thread(target=import_task, daemon=True).start()
+
 
     def _file_vault_password(self) -> str:
         password = self.password_var.get()

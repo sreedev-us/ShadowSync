@@ -135,25 +135,70 @@ def list_mounted_drives() -> List[str]:
             if Path(drive).exists():
                 drives.append(drive)
     else:
+        # Standard Linux mount bases
         mount_bases = [Path("/media"), Path("/mnt"), Path("/run/media")]
+        # Tails/Debian: /media/<user>/<label> — iterate one extra level
         for base in mount_bases:
             if not base.exists():
                 continue
             try:
-                if base == Path("/run/media"):
-                    for user_dir in base.iterdir():
-                        if user_dir.is_dir():
-                            for drive in user_dir.iterdir():
-                                if drive.is_dir():
-                                    drives.append(str(drive))
-                else:
-                    for sub in base.iterdir():
-                        if sub.is_dir():
-                            drives.append(str(sub))
+                for sub in base.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    # /run/media/<user>/<label> or /media/<user>/<label>
+                    # Check if sub is itself a drive (has files) OR a user dir
+                    has_mountable_children = False
+                    try:
+                        for child in sub.iterdir():
+                            if child.is_dir():
+                                # Could be a user dir (e.g. /media/amnesia)
+                                drives.append(str(child))
+                                has_mountable_children = True
+                    except (OSError, PermissionError):
+                        pass
+                    if not has_mountable_children:
+                        # sub itself is a drive mount (e.g. /media/usb0)
+                        drives.append(str(sub))
             except (OSError, PermissionError):
                 pass
-        if not drives:
-            drives.append(str(Path.home()))
+
+        # Tails persistent storage (official install)
+        for tails_persist in (
+            Path("/live/persistence/TailsData_unlocked"),
+            Path("/live/persistence"),
+            Path("/live/mount/medium"),
+        ):
+            if tails_persist.exists() and tails_persist.is_dir():
+                drives.append(str(tails_persist))
+
+        # Ventoy data partition label is typically 'Ventoy'
+        for ventoy_path in (
+            Path("/media/amnesia/Ventoy"),
+            Path("/media/user/Ventoy"),
+            Path("/run/media/amnesia/Ventoy"),
+            Path("/run/media/user/Ventoy"),
+        ):
+            if ventoy_path.exists() and str(ventoy_path) not in drives:
+                drives.append(str(ventoy_path))
+
+        # Always include home as fallback (RAM on Tails but writable)
+        home_str = str(Path.home())
+        if home_str not in drives:
+            drives.append(home_str)
+
+        # Deduplicate while preserving order
+        seen: set = set()
+        unique: List[str] = []
+        for d in drives:
+            try:
+                resolved = str(Path(d).resolve())
+            except OSError:
+                resolved = d
+            if resolved not in seen:
+                seen.add(resolved)
+                unique.append(d)
+        drives = unique
+
     return drives
 
 
@@ -462,7 +507,7 @@ def is_valid_shadowsync_store(path: Path) -> bool:
 
 
 def find_shadowsync_stores(max_depth: int = 3) -> list[Path]:
-    """Scan all drives (Windows) or mount points (Linux) for ShadowSyncStore directories."""
+    """Scan all drives (Windows) or mount points (Linux/Tails/Ventoy) for ShadowSyncStore directories."""
     found: list[Path] = []
     seen: set[Path] = set()
     system = platform.system().lower()
@@ -475,28 +520,21 @@ def find_shadowsync_stores(max_depth: int = 3) -> list[Path]:
             if drive.exists():
                 scan_roots.append(drive)
     else:
-        mount_bases = [Path("/media"), Path("/mnt"), Path("/run/media"), Path.home()]
-        for base in mount_bases:
-            if base.exists():
-                if base == Path("/run/media"):
-                    try:
-                        for user_dir in base.iterdir():
-                            if user_dir.is_dir():
-                                for drive in user_dir.iterdir():
-                                    if drive.is_dir():
-                                        scan_roots.append(drive)
-                    except (OSError, PermissionError):
-                        pass
-                elif base in (Path("/media"), Path("/mnt")):
-                    try:
-                        for sub in base.iterdir():
-                            if sub.is_dir():
-                                scan_roots.append(sub)
-                    except (OSError, PermissionError):
-                        pass
-                else:
-                    scan_roots.append(base)
-        scan_roots.append(Path.cwd().anchor and Path(Path.cwd().anchor) or Path.cwd())
+        # Use the comprehensive list_mounted_drives() which already handles Tails+Ventoy
+        for d in list_mounted_drives():
+            p = Path(d)
+            if p.exists():
+                scan_roots.append(p)
+        # Also scan home (RAM on Tails but may hold a store)
+        if Path.home() not in scan_roots:
+            scan_roots.append(Path.home())
+        # Tails persistent directory — always check directly
+        for tails_path in (
+            Path("/live/persistence/TailsData_unlocked"),
+            Path("/live/persistence"),
+        ):
+            if tails_path.exists() and tails_path not in scan_roots:
+                scan_roots.append(tails_path)
 
     cwd = Path.cwd()
     prioritized = [cwd]
@@ -514,6 +552,8 @@ def find_shadowsync_stores(max_depth: int = 3) -> list[Path]:
         "$RECYCLE.BIN", "$Recycle.Bin", "lost+found", "Windows", "Program Files",
         "Program Files (x86)", "ProgramData", "Recovery", ".Trash",
         "AppData", ".local", ".cache", ".config",
+        # Ventoy/live system directories to skip
+        "syslinux", "EFI", "boot", "ventoy", "live",
     }
 
     def _scan_dir(directory: Path, depth: int) -> None:
@@ -968,14 +1008,26 @@ class OSSettingsWorker:
 
     @staticmethod
     def _sudo_prefix() -> List[str]:
-        """Return sudo prefix when not root, for subprocess calls."""
+        """Return sudo prefix when not root, for subprocess calls.
+
+        On Tails, the 'amnesia' user has passwordless sudo configured,
+        so we use plain 'sudo' (without -n) to allow it to work.
+        On other systems we still try pkexec first for GUI contexts.
+        """
         if OSSettingsWorker._is_root():
             return []
-        # Prefer pkexec for GUI contexts, fall back to sudo
+        # On Tails the user is 'amnesia' and passwordless sudo is available
+        # Detect Tails by checking /etc/os-release or specific Tails paths
+        _is_tails = Path("/etc/amnesia").exists() or Path("/live/boot-dev").exists() or \
+                    Path("/lib/live/mount/medium").exists() or \
+                    os.environ.get("USER", "") == "amnesia" or \
+                    Path.home().name == "amnesia"
+        if shutil.which("sudo"):
+            # On Tails: plain sudo (passwordless)
+            # On other systems: sudo without -n is safer than -n which silently fails
+            return ["sudo"]
         if shutil.which("pkexec"):
             return ["pkexec"]
-        if shutil.which("sudo"):
-            return ["sudo", "-n"]  # -n = non-interactive (fail if needs password)
         return []
 
     def _capture_wifi_windows(self) -> List[WifiProfile]:
@@ -1299,15 +1351,30 @@ class OSSettingsWorker:
 
     @staticmethod
     def _gnome_env() -> Optional[dict]:
-        """Build env dict with correct DBUS_SESSION_BUS_ADDRESS for gsettings."""
+        """Build env dict with correct DBUS_SESSION_BUS_ADDRESS for gsettings.
+
+        Tails boots as user 'amnesia' (uid 1000). The D-Bus session socket is
+        typically at /run/user/1000/bus.  We also check the current user's uid.
+        """
         env = dict(os.environ)
-        if "DBUS_SESSION_BUS_ADDRESS" in env:
-            return env  # already set
-        # Try to find the session bus for the current user
+        if "DBUS_SESSION_BUS_ADDRESS" in env and env["DBUS_SESSION_BUS_ADDRESS"]:
+            return env  # already set — good
+        # Try to find the session bus for the current / expected user
         try:
             import glob as _glob
-            pattern = "/run/user/*/bus"
-            buses = _glob.glob(pattern)
+            # Tails uid is 1000 (amnesia), standard Linux too
+            try:
+                current_uid = os.getuid()
+            except AttributeError:
+                current_uid = 1000
+            # Try current uid first, then common uids
+            for uid in (current_uid, 1000, 1001):
+                bus_path = Path(f"/run/user/{uid}/bus")
+                if bus_path.exists():
+                    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+                    return env
+            # Wildcard fallback
+            buses = _glob.glob("/run/user/*/bus")
             if buses:
                 env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={buses[0]}"
                 return env
@@ -1618,7 +1685,9 @@ class OSSettingsWorker:
 class HydrateConfig:
     """All personalisation settings stored in the encrypted hydrate vault."""
     dark_mode: bool = True
-    wallpaper_path: str = "/live/mount/medium/wallpaper.jpg"
+    # Ventoy mounts at /media/amnesia/Ventoy; Tails installs at /live/mount/medium
+    # Use a neutral empty default — user sets this in the UI
+    wallpaper_path: str = ""
     wifi_profiles: list = None  # list of {ssid, password} — simple plaintext fallback
     git_remote: str = ""
     git_branch: str = "main"
@@ -1723,11 +1792,33 @@ class HydrateWorker:
         self._log("Hydrate: all hooks completed.")
 
     def _apply_dark_mode(self) -> None:
+        """Apply dark mode via gsettings, injecting the correct DBUS env for Tails."""
+        env = None
+        if _IS_LINUX:
+            # Build env with correct DBUS_SESSION_BUS_ADDRESS for Tails/GNOME
+            e = dict(os.environ)
+            if not e.get("DBUS_SESSION_BUS_ADDRESS"):
+                import glob as _glob
+                try:
+                    uid = os.getuid()
+                except AttributeError:
+                    uid = 1000
+                for candidate_uid in (uid, 1000, 1001):
+                    bp = Path(f"/run/user/{candidate_uid}/bus")
+                    if bp.exists():
+                        e["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bp}"
+                        break
+                else:
+                    buses = _glob.glob("/run/user/*/bus")
+                    if buses:
+                        e["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={buses[0]}"
+            env = e
         try:
             subprocess.run(
                 ["gsettings", "set", "org.gnome.desktop.interface",
                  "color-scheme", "prefer-dark"],
                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                **(dict(env=env) if env else {}),
             )
             self._log("Hydrate: dark mode applied.")
         except FileNotFoundError:
@@ -1736,14 +1827,44 @@ class HydrateWorker:
             self._log(f"Hydrate: dark mode failed: {exc.stderr.strip()}")
 
     def _apply_wallpaper(self) -> None:
+        """Apply wallpaper via gsettings, injecting DBUS env for Tails."""
         uri = self.config.wallpaper_path.strip()
+        if not uri:
+            self._log("Hydrate: wallpaper path not set — skipping.")
+            return
         if not uri.startswith(("file://", "http://", "https://")):
             uri = "file://" + uri
+        # Check file actually exists (Ventoy path may differ from Tails install path)
+        if uri.startswith("file://"):
+            local_path = uri[7:]
+            if not Path(local_path).exists():
+                self._log(f"Hydrate: wallpaper file not found at {local_path} — skipping.")
+                return
+        env = None
+        if _IS_LINUX:
+            e = dict(os.environ)
+            if not e.get("DBUS_SESSION_BUS_ADDRESS"):
+                import glob as _glob
+                try:
+                    uid = os.getuid()
+                except AttributeError:
+                    uid = 1000
+                for candidate_uid in (uid, 1000, 1001):
+                    bp = Path(f"/run/user/{candidate_uid}/bus")
+                    if bp.exists():
+                        e["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bp}"
+                        break
+                else:
+                    buses = _glob.glob("/run/user/*/bus")
+                    if buses:
+                        e["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={buses[0]}"
+            env = e
         try:
             for key in ("picture-uri", "picture-uri-dark"):
                 subprocess.run(
                     ["gsettings", "set", "org.gnome.desktop.background", key, uri],
                     check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    **(dict(env=env) if env else {}),
                 )
             self._log(f"Hydrate: wallpaper set → {uri}")
         except FileNotFoundError:
@@ -2544,9 +2665,38 @@ class ShadowSyncWorker:
             wipe_directory(staging)
 
     def _launch(self, executable: Path) -> subprocess.Popen:
+        """
+        Launch the executable.
+
+        Ventoy/FAT/exFAT filesystems are typically mounted `noexec`, which means
+        chmod +x works locally but the kernel still refuses to execute the file.
+        If the file lives on a noexec filesystem, we copy it to /tmp first and
+        run from there.  This is safe because we've already verified its SHA-256.
+        """
         if platform.system().lower() != "windows":
-            mode = executable.stat().st_mode
-            executable.chmod(mode | stat.S_IXUSR)
+            try:
+                mode = executable.stat().st_mode
+                executable.chmod(mode | stat.S_IXUSR)
+            except (OSError, PermissionError):
+                pass  # noexec fs — handled below
+
+            # Check if the file is on a noexec filesystem by trying os.access
+            if not os.access(str(executable), os.X_OK):
+                self._log(f"Executable is on a noexec filesystem (Ventoy/FAT). Copying to /tmp…")
+                import tempfile as _tmp
+                tmp_dir = Path(_tmp.mkdtemp(prefix="shadowsync-exec-"))
+                tmp_exe = tmp_dir / executable.name
+                shutil.copy2(str(executable), str(tmp_exe))
+                try:
+                    tmp_exe.chmod(0o755)
+                except OSError:
+                    pass
+                # Register cleanup
+                import atexit as _atexit
+                _atexit.register(shutil.rmtree, str(tmp_dir), True)
+                executable = tmp_exe
+                self._log(f"Running from /tmp copy: {executable}")
+
         if self.options.sandbox_app:
             command = build_bwrap_command(executable, self.options.profile_dir.expanduser().resolve())
             if command:
